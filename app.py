@@ -17,9 +17,9 @@ app.add_middleware(SessionMiddleware, secret_key="super-secret-random-key-123")
 APP_PASSWORD = "secret123" 
 subscribers = set()
 
-# These pull from Render's Environment Variables
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# --- FIXED: .strip() removes any hidden \n or spaces from copy-pasting ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 MAX_TRADES_PER_DAY = 4
 MAX_DAILY_LOSS_R = -2.0 
@@ -98,6 +98,8 @@ async def send_telegram(message):
             r = await client.post(url, json=payload)
             if r.status_code != 200:
                 print(f"Telegram API Error: {r.text}")
+            else:
+                print("Telegram message sent successfully!")
         except Exception as e:
             print(f"Telegram connection error: {e}")
 
@@ -254,7 +256,6 @@ def check_market(symbol, yf_ticker):
 async def worker():
     tickers = {"EURUSD": "EURUSD=X", "XAUUSD": "GC=F", "GBPUSD": "GBPUSD=X"}
     
-    # Send startup message
     print("Checking Telegram configuration...")
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         await send_telegram("🤖 <b>Trading Bot Online!</b>\nYour dashboard is now connected to Telegram.")
