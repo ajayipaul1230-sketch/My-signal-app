@@ -16,7 +16,9 @@ app.add_middleware(SessionMiddleware, secret_key="super-secret-random-key-123")
 APP_PASSWORD = "secret123" 
 subscribers = set()
 
+# --- RISK SETTINGS ---
 MAX_TRADES_PER_DAY = 4
+MAX_DAILY_LOSS_R = -2.0  # Stop trading if daily losses hit -2.0R
 MIN_SCORE = 7
 SWING_STRENGTH_H1 = 3
 SWING_STRENGTH_H4 = 5
@@ -26,38 +28,68 @@ MIN_SWING_ATR_MULT = 0.6
 def init_db():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
+    # Added status column (OPEN, WIN, LOSS)
     c.execute('''CREATE TABLE IF NOT EXISTS signals (
             id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, strategy TEXT, 
-            dir TEXT, score INTEGER, entry REAL, sl REAL, tp REAL)''')
+            dir TEXT, score INTEGER, entry REAL, sl REAL, tp REAL,
+            status TEXT DEFAULT 'OPEN')''')
     conn.commit(); conn.close()
 
 def save_signal(sig):
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
-    c.execute("INSERT INTO signals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", 
-              (sig["id"], sig["ts"], sig["symbol"], sig["strategy"], sig["dir"], sig["score"], sig["entry"], sig["sl"], sig["tp"]))
+    c.execute("INSERT INTO signals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
+              (sig["id"], sig["ts"], sig["symbol"], sig["strategy"], sig["dir"], 
+               sig["score"], sig["entry"], sig["sl"], sig["tp"], "OPEN"))
     conn.commit(); conn.close()
 
-def get_trades_today():
+def update_trade_status(trade_id, status):
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM signals WHERE ts >= date('now')")
-    count = c.fetchone()[0]
-    conn.close(); return count
+    c.execute("UPDATE signals SET status = ? WHERE id = ?", (status, trade_id))
+    conn.commit(); conn.close()
+
+def get_open_trades():
+    conn = sqlite3.connect("signals.db")
+    c = conn.cursor()
+    c.execute("SELECT * FROM signals WHERE status = 'OPEN'")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "symbol": r[2], "dir": r[4], "entry": r[6], "sl": r[7], "tp": r[8]} for r in rows]
+
+def get_daily_stats():
+    """Returns (trades_today, daily_R)"""
+    conn = sqlite3.connect("signals.db")
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*), status FROM signals WHERE ts >= date('now') GROUP BY status")
+    rows = c.fetchall()
+    conn.close()
+    
+    trades_today = 0
+    daily_R = 0.0
+    
+    for count, status in rows:
+        trades_today += count
+        if status == "WIN":
+            daily_R += 1.5 # Assume 1.5R average win for now
+        elif status == "LOSS":
+            daily_R -= 1.0 # 1R loss
+            
+    return trades_today, daily_R
 
 def get_recent_signals():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
-    c.execute("SELECT * FROM signals ORDER BY ts DESC LIMIT 15")
+    c.execute("SELECT * FROM signals ORDER BY ts DESC LIMIT 20")
     rows = c.fetchall()
     conn.close()
-    return [{"id": r[0], "ts": r[1], "symbol": r[2], "strategy": r[3], "dir": r[4], "score": r[5], "entry": r[6], "sl": r[7], "tp": r[8]} for r in rows]
+    return [{"id": r[0], "ts": r[1], "symbol": r[2], "strategy": r[3], "dir": r[4], "score": r[5], "entry": r[6], "sl": r[7], "tp": r[8], "status": r[9]} for r in rows]
 
 async def publish(event: str, data: dict):
     for q in list(subscribers):
         await q.put({"event": event, "data": data})
 
-# --- V2.1 MATH ---
+# --- V2.1 MATH (Unchanged) ---
 def find_swings(df, strength, atr_val):
     highs = df['High'].values
     lows = df['Low'].values
@@ -94,41 +126,27 @@ def check_c1c2_rejection(df):
     return None
 
 def detect_abcd(df, direction, atr):
-    """§9.5 Valid AB=CD pattern detection (Simplified for H1 swings)"""
     if len(df) < 10: return False
-    
-    # We look at the last 4 major swing points to find A, B, C, D
     highs, lows = find_swings(df, 3, atr)
     if len(highs) < 2 or len(lows) < 2: return False
 
-    # For a Long (Bullish AB=CD): A is low, B is high, C is low, D is low (higher than C)
-    # For a Short (Bearish AB=CD): A is high, B is low, C is high, D is high (lower than C)
-    
     if direction == "long":
-        # Simplified check: We just assume if we are at a swing low, we check the AB=CD ratio
-        # In a full implementation, you'd map the exact A,B,C,D points.
         recent_lows = lows[-2:]
         if len(recent_lows) == 2:
             ab_leg = abs(highs[-1] - recent_lows[0])
             cd_leg = abs(highs[-1] - recent_lows[-1])
-            # CD must be 90% to 110% of AB
-            if ab_leg > 0 and 0.9 <= (cd_leg / ab_leg) <= 1.1:
-                return True
+            if ab_leg > 0 and 0.9 <= (cd_leg / ab_leg) <= 1.1: return True
     else:
         recent_highs = highs[-2:]
         if len(recent_highs) == 2:
             ab_leg = abs(recent_highs[0] - lows[-1])
             cd_leg = abs(recent_highs[-1] - lows[-1])
-            if ab_leg > 0 and 0.9 <= (cd_leg / ab_leg) <= 1.1:
-                return True
-                
+            if ab_leg > 0 and 0.9 <= (cd_leg / ab_leg) <= 1.1: return True
     return False
 
 def calculate_score(df_h1, direction, bias, atr):
     score = 0
     reasons = []
-
-    # 1. RSI Overbought/Oversold (1 Point)
     delta = df_h1['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -136,21 +154,47 @@ def calculate_score(df_h1, direction, bias, atr):
     current_rsi = float((100 - (100 / (1 + rs))).iloc[-1])
     if (direction == "long" and current_rsi < 20) or (direction == "short" and current_rsi > 80):
         score += 1; reasons.append("RSI")
-
-    # 2. Structure Alignment (2 Points) - Automatically passed by HTF filter
     if (direction == "long" and bias in ["long_only", "both"]) or \
        (direction == "short" and bias in ["short_only", "both"]):
         score += 2; reasons.append("Struct")
-
-    # 3. Ratio Confirmation (2 Points) - Simplified: if we have valid swings
     score += 2; reasons.append("Ratio")
-
-    # 4. AB=CD Completion (2 Points)
     if detect_abcd(df_h1, direction, atr):
         score += 2; reasons.append("AB=CD")
-
     return score, "+".join(reasons)
 
+# --- TRADE LIFECYCLE & GUARD ---
+def check_open_trades(tickers):
+    """Checks current price against SL and TP of open trades"""
+    open_trades = get_open_trades()
+    if not open_trades: return
+
+    for trade in open_trades:
+        try:
+            # Fetch latest 1-minute candle for quick update
+            ticker = tickers.get(trade["symbol"])
+            if not ticker: continue
+            
+            df = yf.download(tickers=ticker, period="1d", interval="1m", progress=False, multi_level_index=False)
+            if df.empty: continue
+            
+            current_price = float(df['Close'].iloc[-1])
+            
+            hit_status = None
+            if trade["dir"] == "long":
+                if current_price >= trade["tp"]: hit_status = "WIN"
+                elif current_price <= trade["sl"]: hit_status = "LOSS"
+            else:
+                if current_price <= trade["tp"]: hit_status = "WIN"
+                elif current_price >= trade["sl"]: hit_status = "LOSS"
+
+            if hit_status:
+                print(f"!!! TRADE CLOSED: {trade['symbol']} hit {hit_status} !!!")
+                update_trade_status(trade["id"], hit_status)
+                await publish("trade_update", {"id": trade["id"], "status": hit_status})
+        except Exception as e:
+            pass # Ignore errors on 1m data fetching
+
+# --- MAIN WORKER ---
 def check_market(symbol, yf_ticker):
     try:
         df_h1 = yf.download(tickers=yf_ticker, period="5d", interval="1h", progress=False, multi_level_index=False)
@@ -175,11 +219,8 @@ def check_market(symbol, yf_ticker):
         if rejection_dir == "short" and bias not in ["short_only", "both"]: return None
 
         score, reason_string = calculate_score(df_h1, rejection_dir, bias, current_atr)
+        if score < MIN_SCORE: return None
 
-        if score < MIN_SCORE:
-            return None
-
-        # Calculate SL and TP (v2.1 ATR logic: 1.5 ATR Stop, 2.0 ATR TP)
         if rejection_dir == "long":
             sl = round(current_price - (1.5 * current_atr), 4)
             tp = round(current_price + (2.0 * current_atr), 4)
@@ -187,7 +228,6 @@ def check_market(symbol, yf_ticker):
             sl = round(current_price + (1.5 * current_atr), 4)
             tp = round(current_price - (2.0 * current_atr), 4)
 
-        # --- §4a PER-ASSET RR FLOOR ---
         risk = abs(current_price - sl)
         reward = abs(tp - current_price)
         rr = reward / risk if risk > 0 else 0
@@ -196,41 +236,50 @@ def check_market(symbol, yf_ticker):
         if symbol in ["XAUUSD", "BTCUSD"]: min_rr = 1.70
         elif symbol == "USDCAD": min_rr = 1.50
 
-        if rr < min_rr:
-            print(f"[{symbol}] Rejected: RR {rr:.2f} below floor {min_rr}")
-            return None
+        if rr < min_rr: return None
 
         return {
             "id": str(uuid.uuid4())[:6],
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol,
-            "strategy": f"Score {score}/12 ({reason_string}) | RR: {rr:.1f}",
+            "strategy": f"Score {score}/12 ({reason_string})",
             "dir": rejection_dir,
             "score": score,
             "entry": round(current_price, 4),
             "sl": sl,
             "tp": tp
         }
-
     except Exception as e:
-        print(f"Error checking {symbol}: {e}")
         return None
 
 async def worker():
     tickers = {"EURUSD": "EURUSD=X", "XAUUSD": "GC=F", "GBPUSD": "GBPUSD=X"}
+    
     while True:
-        if get_trades_today() >= MAX_TRADES_PER_DAY:
+        # 1. Check if existing trades hit TP or SL
+        check_open_trades(tickers)
+        
+        # 2. Check RiskGuard limits
+        trades_today, daily_R = get_daily_stats()
+        
+        if daily_R <= MAX_DAILY_LOSS_R:
+            print(f"CIRCUIT BREAKER: Daily Loss hit {daily_R}R. Trading halted until tomorrow.")
+            await asyncio.sleep(300) # Sleep 5 mins
+            continue
+            
+        if trades_today >= MAX_TRADES_PER_DAY:
             await asyncio.sleep(300)
             continue
 
-        print("Scanning markets (v2.1 AB=CD & RR)...")
+        # 3. Scan for new setups
+        print(f"Scanning markets... (Trades today: {trades_today}/4 | Daily R: {daily_R})")
         for symbol, ticker in tickers.items():
             sig = check_market(symbol, ticker)
             if sig:
-                print(f"!!! TRADE: {symbol} {sig['dir'].upper()} | {sig['strategy']} !!!")
+                print(f"!!! NEW SIGNAL: {symbol} {sig['dir'].upper()} | {sig['strategy']} !!!")
                 save_signal(sig)
                 await publish("signal", sig)
-                if get_trades_today() >= MAX_TRADES_PER_DAY: break
+                if get_daily_stats()[0] >= MAX_TRADES_PER_DAY: break
         
         await asyncio.sleep(60)
 
@@ -239,7 +288,7 @@ async def startup():
     init_db()
     asyncio.create_task(worker())
 
-# --- WEB ROUTES (unchanged) ---
+# --- WEB ROUTES ---
 @app.get("/healthz")
 def healthz(): return {"status": "ok"}
 
@@ -292,30 +341,50 @@ def index(request: Request):
         .card { border: 1px solid #26303b; padding: 15px; margin-bottom: 10px; border-radius: 6px; background: #171c23; }
         .long { color: #3fb950; font-weight: bold; } .short { color: #f85149; font-weight: bold; }
         .row { display: flex; justify-content: space-between; margin-top: 5px; font-size: 12px; color: #8b98a5;}
+        .badge { padding: 2px 6px; border-radius: 4px; font-size: 10px; margin-left: 10px; font-weight: bold; }
+        .bg-open { background: #1f6feb; color: white; }
+        .bg-win { background: #238636; color: white; }
+        .bg-loss { background: #da3633; color: white; }
     </style></head>
     <body>
-        <h2>v2.1 Live Signals (Strict AB=CD & RR)</h2>
+        <h2>v2.1 Live Signals (RiskGuard Active)</h2>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');
             function addCard(d) {
                 const div = document.createElement('div');
+                div.id = 'trade-' + d.id;
                 div.className = 'card';
                 const timeOnly = d.ts.includes(' ') ? d.ts.split(' ')[1] : d.ts;
-                div.innerHTML = `<div><b>[${timeOnly}]</b> ${d.symbol} <span class="${d.dir}">${d.dir.toUpperCase()}</span> | ${d.strategy}</div>
+                const badgeClass = d.status === 'WIN' ? 'bg-win' : (d.status === 'LOSS' ? 'bg-loss' : 'bg-open');
+                
+                div.innerHTML = `<div><b>[${timeOnly}]</b> ${d.symbol} <span class="${d.dir}">${d.dir.toUpperCase()}</span> | ${d.strategy} 
+                                 <span class="badge ${badgeClass}">${d.status}</span></div>
                                  <div class="row"><span>Entry: ${d.entry}</span><span>SL: ${d.sl}</span><span>TP: ${d.tp}</span></div>`;
                 return div;
             }
+            
             fetch('/api/history').then(r => r.json()).then(data => {
                 list.innerHTML = '';
-                if(data.length === 0) list.innerHTML = "Scanning for valid AB=CD...";
+                if(data.length === 0) list.innerHTML = "Scanning...";
                 data.forEach(d => list.appendChild(addCard(d)));
             });
+            
             const es = new EventSource('/stream');
             es.addEventListener('signal', e => {
                 const d = JSON.parse(e.data);
                 if(list.innerText.includes("Scanning")) list.innerHTML = "";
                 list.prepend(addCard(d));
+            });
+            
+            es.addEventListener('trade_update', e => {
+                const d = JSON.parse(e.data);
+                const card = document.getElementById('trade-' + d.id);
+                if (card) {
+                    const badge = card.querySelector('.badge');
+                    badge.className = 'badge ' + (d.status === 'WIN' ? 'bg-win' : 'bg-loss');
+                    badge.innerText = d.status;
+                }
             });
         </script>
     </body>
