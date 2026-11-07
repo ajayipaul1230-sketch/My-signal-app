@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timezone
 import pandas as pd
 import yfinance as yf
+import httpx
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
@@ -15,6 +16,10 @@ app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="super-secret-random-key-123")
 APP_PASSWORD = "secret123" 
 subscribers = set()
+
+# --- TELEGRAM SETTINGS ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 MAX_TRADES_PER_DAY = 4
 MAX_DAILY_LOSS_R = -2.0 
@@ -27,7 +32,7 @@ MIN_SWING_ATR_MULT = 0.6
 def init_db():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
-    c.execute("DROP TABLE IF EXISTS signals") # Resets DB for new schema
+    c.execute("DROP TABLE IF EXISTS signals") 
     c.execute('''CREATE TABLE signals (
             id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, strategy TEXT, 
             dir TEXT, score INTEGER, entry REAL, sl REAL, tp REAL,
@@ -62,15 +67,12 @@ def get_daily_stats():
     c.execute("SELECT COUNT(*), status FROM signals WHERE ts >= date('now') GROUP BY status")
     rows = c.fetchall()
     conn.close()
-    
     trades_today = 0
     daily_R = 0.0
-    
     for count, status in rows:
         trades_today += count
         if status == "WIN": daily_R += 1.5 
         elif status == "LOSS": daily_R -= 1.0 
-            
     return trades_today, daily_R
 
 def get_recent_signals():
@@ -84,6 +86,19 @@ def get_recent_signals():
 async def publish(event: str, data: dict):
     for q in list(subscribers):
         await q.put({"event": event, "data": data})
+
+# --- TELEGRAM ALERT FUNCTION ---
+async def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured. Skipping alert.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(url, json=payload)
+        except Exception as e:
+            print(f"Telegram error: {e}")
 
 # --- V2.1 MATH ---
 def find_swings(df, strength, atr_val):
@@ -155,11 +170,9 @@ def calculate_score(df_h1, direction, bias, atr):
         score += 2; reasons.append("AB=CD")
     return score, "+".join(reasons)
 
-# --- FIXED: NOW AN ASYNC FUNCTION ---
 async def check_open_trades(tickers):
     open_trades = get_open_trades()
     if not open_trades: return
-
     for trade in open_trades:
         try:
             ticker = tickers.get(trade["symbol"])
@@ -180,6 +193,8 @@ async def check_open_trades(tickers):
                 print(f"!!! TRADE CLOSED: {trade['symbol']} hit {hit_status} !!!")
                 update_trade_status(trade["id"], hit_status)
                 await publish("trade_update", {"id": trade["id"], "status": hit_status})
+                # Optionally send a Telegram message when a trade closes:
+                await send_telegram(f"🏁 <b>TRADE CLOSED: {trade['symbol']}</b>\nResult: {hit_status}")
         except Exception as e:
             pass 
 
@@ -238,13 +253,15 @@ def check_market(symbol, yf_ticker):
 
 async def worker():
     tickers = {"EURUSD": "EURUSD=X", "XAUUSD": "GC=F", "GBPUSD": "GBPUSD=X"}
+    
+    # --- TEST TELEGRAM MESSAGE ON STARTUP ---
+    await send_telegram("🤖 <b>Trading Bot Online!</b>\nYour dashboard is now connected to Telegram.")
+
     while True:
-        await check_open_trades(tickers) # Now calling it properly with await
-        
+        await check_open_trades(tickers)
         trades_today, daily_R = get_daily_stats()
         
         if daily_R <= MAX_DAILY_LOSS_R:
-            print(f"CIRCUIT BREAKER: Daily Loss hit {daily_R}R. Trading halted.")
             await asyncio.sleep(300)
             continue
             
@@ -259,6 +276,17 @@ async def worker():
                 print(f"!!! NEW SIGNAL: {symbol} {sig['dir'].upper()} !!!")
                 save_signal(sig)
                 await publish("signal", sig)
+                
+                # --- TELEGRAM ALERT FOR NEW SIGNAL ---
+                emoji = "🟢" if sig['dir'] == 'long' else "🔴"
+                msg = (f"{emoji} <b>NEW SIGNAL: {sig['symbol']}</b>\n"
+                       f"Direction: {sig['dir'].upper()}\n"
+                       f"Entry: {sig['entry']}\n"
+                       f"SL: {sig['sl']}\n"
+                       f"TP: {sig['tp']}\n"
+                       f"{sig['strategy']}")
+                await send_telegram(msg)
+
                 if get_daily_stats()[0] >= MAX_TRADES_PER_DAY: break
         
         await asyncio.sleep(60)
@@ -327,7 +355,7 @@ def index(request: Request):
         .bg-loss { background: #da3633; color: white; }
     </style></head>
     <body>
-        <h2>v2.1 Live Signals (RiskGuard Active)</h2>
+        <h2>v2.1 Live Signals (Telegram Active)</h2>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');

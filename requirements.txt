@@ -4,3 +4,4 @@ itsdangerous
 python-multipart
 yfinance
 pandas
+httpx
