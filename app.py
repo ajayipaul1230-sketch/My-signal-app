@@ -17,10 +17,9 @@ app.add_middleware(SessionMiddleware, secret_key="super-secret-random-key-123")
 APP_PASSWORD = "secret123" 
 subscribers = set()
 
-# --- TELEGRAM SETTINGS ---
-TELEGRAM_TOKEN = os.environ.get("8927484419:AAHAY0-X77GkBv13hQeCIcTRo39WT-X3C3E
-", "")
-TELEGRAM_CHAT_ID = os.environ.get("7185853274", "")
+# These pull from Render's Environment Variables
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 MAX_TRADES_PER_DAY = 4
 MAX_DAILY_LOSS_R = -2.0 
@@ -88,7 +87,6 @@ async def publish(event: str, data: dict):
     for q in list(subscribers):
         await q.put({"event": event, "data": data})
 
-# --- TELEGRAM ALERT FUNCTION ---
 async def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram not configured. Skipping alert.")
@@ -97,9 +95,11 @@ async def send_telegram(message):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(url, json=payload)
+            r = await client.post(url, json=payload)
+            if r.status_code != 200:
+                print(f"Telegram API Error: {r.text}")
         except Exception as e:
-            print(f"Telegram error: {e}")
+            print(f"Telegram connection error: {e}")
 
 # --- V2.1 MATH ---
 def find_swings(df, strength, atr_val):
@@ -194,7 +194,6 @@ async def check_open_trades(tickers):
                 print(f"!!! TRADE CLOSED: {trade['symbol']} hit {hit_status} !!!")
                 update_trade_status(trade["id"], hit_status)
                 await publish("trade_update", {"id": trade["id"], "status": hit_status})
-                # Optionally send a Telegram message when a trade closes:
                 await send_telegram(f"🏁 <b>TRADE CLOSED: {trade['symbol']}</b>\nResult: {hit_status}")
         except Exception as e:
             pass 
@@ -255,8 +254,12 @@ def check_market(symbol, yf_ticker):
 async def worker():
     tickers = {"EURUSD": "EURUSD=X", "XAUUSD": "GC=F", "GBPUSD": "GBPUSD=X"}
     
-    # --- TEST TELEGRAM MESSAGE ON STARTUP ---
-    await send_telegram("🤖 <b>Trading Bot Online!</b>\nYour dashboard is now connected to Telegram.")
+    # Send startup message
+    print("Checking Telegram configuration...")
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        await send_telegram("🤖 <b>Trading Bot Online!</b>\nYour dashboard is now connected to Telegram.")
+    else:
+        print("Telegram Token or Chat ID missing in Environment Variables.")
 
     while True:
         await check_open_trades(tickers)
@@ -278,7 +281,6 @@ async def worker():
                 save_signal(sig)
                 await publish("signal", sig)
                 
-                # --- TELEGRAM ALERT FOR NEW SIGNAL ---
                 emoji = "🟢" if sig['dir'] == 'long' else "🔴"
                 msg = (f"{emoji} <b>NEW SIGNAL: {sig['symbol']}</b>\n"
                        f"Direction: {sig['dir'].upper()}\n"
