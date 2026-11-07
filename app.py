@@ -65,9 +65,10 @@ def check_market(symbol, yf_ticker):
         df['TR'] = df['High'] - df['Low']
         df['ATR'] = df['TR'].rolling(window=14).mean()
 
-        current_price = float(df['Close'].iloc[-1])
-        current_rsi = float(df['RSI'].iloc[-1])
-        current_atr = float(df['ATR'].iloc[-1])
+        # Safely extract the numbers (handles Yahoo Finance MultiIndex)
+        current_price = float(df['Close'].iloc[-1].item()) if hasattr(df['Close'].iloc[-1], 'item') else float(df['Close'].iloc[-1])
+        current_rsi = float(df['RSI'].iloc[-1].item()) if hasattr(df['RSI'].iloc[-1], 'item') else float(df['RSI'].iloc[-1])
+        current_atr = float(df['ATR'].iloc[-1].item()) if hasattr(df['ATR'].iloc[-1], 'item') else float(df['ATR'].iloc[-1])
 
         # 3. Define a trigger (SIMPLIFIED FOR NOW)
         # If RSI is < 30, we assume a Long setup. If > 70, Short setup.
