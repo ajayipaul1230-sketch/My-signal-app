@@ -56,109 +56,94 @@ async def publish(event: str, data: dict):
     for q in list(subscribers):
         await q.put({"event": event, "data": data})
 
-# --- V2.1 STRATEGY MATH ---
+# --- V2.1 MATH ---
 def find_swings(df, strength, atr_val):
-    """Finds confirmed swing highs/lows based on v2.1 spec (§7)"""
     highs = df['High'].values
     lows = df['Low'].values
     swing_highs = []
     swing_lows = []
-    
-    # We only look at confirmed swings (strength bars before and after)
     for i in range(strength, len(df) - strength):
-        # Check Swing High
         if highs[i] == max(highs[i-strength:i+strength+1]):
-            # Check magnitude filter
             if (highs[i] - min(lows[i-strength:i+strength+1])) >= (MIN_SWING_ATR_MULT * atr_val):
                 swing_highs.append(highs[i])
-                
-        # Check Swing Low
         if lows[i] == min(lows[i-strength:i+strength+1]):
             if (max(highs[i-strength:i+strength+1]) - lows[i]) >= (MIN_SWING_ATR_MULT * atr_val):
                 swing_lows.append(lows[i])
-                
     return swing_highs, swing_lows
 
 def check_htf_bias(df_h4, current_price, atr_h4):
-    """Checks §7a.1 Hard HTF Bias Filter"""
     h4_highs, h4_lows = find_swings(df_h4, SWING_STRENGTH_H4, atr_h4)
-    
     if not h4_highs or not h4_lows:
         return "neutral", None, None
 
     last_h4_low = h4_lows[-1]
     last_h4_high = h4_highs[-1]
 
-    # Long setup: Price must be above the most recent H4 swing low
-    # OR H4 structure making higher lows (simplified to just price > last low for now)
-    if current_price > last_h4_low:
-        long_allowed = True
-    else:
-        long_allowed = False
+    long_allowed = current_price > last_h4_low
+    short_allowed = current_price < last_h4_high
 
-    # Short setup: Price must be below the most recent H4 swing high
-    if current_price < last_h4_high:
-        short_allowed = True
-    else:
-        short_allowed = False
+    if long_allowed and not short_allowed: return "long_only", last_h4_high, last_h4_low
+    elif short_allowed and not long_allowed: return "short_only", last_h4_high, last_h4_low
+    else: return "both", last_h4_high, last_h4_low
 
-    if long_allowed and not short_allowed:
-        return "long_only", last_h4_high, last_h4_low
-    elif short_allowed and not long_allowed:
-        return "short_only", last_h4_high, last_h4_low
-    else:
-        return "both", last_h4_high, last_h4_low # Price is inside the range
+def check_c1c2_rejection(df):
+    """§9.6 LTF Rejection Confirmation"""
+    if len(df) < 3: return None
+    
+    # C1 is the second to last candle. C2 is the last (closed) candle.
+    c1 = df.iloc[-2]
+    c2 = df.iloc[-1]
+
+    c1_range = c1['High'] - c1['Low']
+    if c1_range == 0: return None
+
+    # Long Setup
+    c1_long_valid = ((c1['Close'] - c1['Low']) / c1_range >= 0.75) and (c1['Close'] > c1['Open'])
+    if c1_long_valid and (c2['Close'] > c1['High']):
+        return "long"
+
+    # Short Setup
+    c1_short_valid = ((c1['High'] - c1['Close']) / c1_range >= 0.75) and (c1['Close'] < c1['Open'])
+    if c1_short_valid and (c2['Close'] < c1['Low']):
+        return "short"
+
+    return None
 
 def check_market(symbol, yf_ticker):
     try:
-        # 1. Download H1 Data (5 days)
+        # Download 5 days of H1 data (grabbing extra to ensure we have enough for H4)
         df_h1 = yf.download(tickers=yf_ticker, period="5d", interval="1h", progress=False, multi_level_index=False)
         if df_h1.empty: return None
 
-        # 2. Resample H1 to H4 for HTF Bias
         df_h4 = df_h1.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
 
-        # 3. Calculate ATR (H1)
+        # ATRs
         df_h1['TR'] = df_h1['High'] - df_h1['Low']
         df_h1['ATR'] = df_h1['TR'].rolling(window=14).mean()
         current_atr = float(df_h1['ATR'].iloc[-1])
         current_price = float(df_h1['Close'].iloc[-1])
 
-        # 4. Calculate ATR (H4)
         df_h4['TR'] = df_h4['High'] - df_h4['Low']
         df_h4['ATR'] = df_h4['TR'].rolling(window=14).mean()
         atr_h4 = float(df_h4['ATR'].iloc[-1])
 
-        # 5. Find H1 Swings
-        h1_highs, h1_lows = find_swings(df_h1, SWING_STRENGTH_H1, current_atr)
-
-        # 6. Check HTF Bias Filter
+        # 1. Get HTF Bias
         bias, h4_high, h4_low = check_htf_bias(df_h4, current_price, atr_h4)
 
-        # --- TRIGGER LOGIC ---
-        # For now, we just trigger if a new H1 swing just formed, 
-        # but ONLY in the direction allowed by the H4 Bias.
-        
+        # 2. Check C1/C2 Rejection on H1
+        rejection_dir = check_c1c2_rejection(df_h1)
+        if not rejection_dir: return None
+
+        # 3. Combine: Only trade if Rejection matches HTF Bias
         direction = None
-        strategy_name = None
+        if rejection_dir == "long" and bias in ["long_only", "both"]:
+            direction = "long"
+        elif rejection_dir == "short" and bias in ["short_only", "both"]:
+            direction = "short"
 
-        # Basic Breakout Logic for testing the filter
-        if bias in ["long_only", "both"]:
-            # If current price breaks the last H1 swing high
-            if len(h1_highs) > 0 and current_price > h1_highs[-1]:
-                direction = "long"
-                strategy_name = f"Breakout (H4 Bias: {bias})"
+        if not direction: return None
 
-        if bias in ["short_only", "both"] and direction is None:
-            # If current price breaks the last H1 swing low
-            if len(h1_lows) > 0 and current_price < h1_lows[-1]:
-                direction = "short"
-                strategy_name = f"Breakout (H4 Bias: {bias})"
-
-        if not direction:
-            return None
-
-        # Calculate SL and TP
+        # Calculate SL and TP (using v2.1 ATR logic for now)
         if direction == "long":
             sl = round(current_price - (1.5 * current_atr), 4)
             tp = round(current_price + (2.0 * current_atr), 4)
@@ -170,7 +155,7 @@ def check_market(symbol, yf_ticker):
             "id": str(uuid.uuid4())[:6],
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol,
-            "strategy": strategy_name,
+            "strategy": f"C1/C2 ({bias})",
             "dir": direction,
             "score": 7,
             "entry": round(current_price, 4),
@@ -189,7 +174,7 @@ async def worker():
             await asyncio.sleep(300)
             continue
 
-        print("Scanning markets (v2.1 HTF Bias + Swings)...")
+        print("Scanning markets (v2.1 C1/C2 Rejection)...")
         for symbol, ticker in tickers.items():
             sig = check_market(symbol, ticker)
             if sig:
@@ -260,7 +245,7 @@ def index(request: Request):
         .row { display: flex; justify-content: space-between; margin-top: 5px; font-size: 12px; color: #8b98a5;}
     </style></head>
     <body>
-        <h2>v2.1 Live Signals (HTF Bias Filter)</h2>
+        <h2>v2.1 Live Signals (C1/C2 Rejection)</h2>
         <p style="color:#8b98a5; font-size:12px;">Scanning EURUSD, XAUUSD, GBPUSD (Max 4/day).</p>
         <div id="list">Loading history...</div>
         <script>
@@ -275,7 +260,7 @@ def index(request: Request):
             }
             fetch('/api/history').then(r => r.json()).then(data => {
                 list.innerHTML = '';
-                if(data.length === 0) list.innerHTML = "Scanning for v2.1 Breakouts...";
+                if(data.length === 0) list.innerHTML = "Scanning for C1/C2 Rejections...";
                 data.forEach(d => list.appendChild(addCard(d)));
             });
             const es = new EventSource('/stream');
