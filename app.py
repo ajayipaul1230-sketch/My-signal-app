@@ -27,8 +27,7 @@ MIN_SWING_ATR_MULT = 0.6
 def init_db():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
-    # CRITICAL FIX: Drop the old table to apply the new 10-column schema
-    c.execute("DROP TABLE IF EXISTS signals")
+    c.execute("DROP TABLE IF EXISTS signals") # Resets DB for new schema
     c.execute('''CREATE TABLE signals (
             id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, strategy TEXT, 
             dir TEXT, score INTEGER, entry REAL, sl REAL, tp REAL,
@@ -156,7 +155,8 @@ def calculate_score(df_h1, direction, bias, atr):
         score += 2; reasons.append("AB=CD")
     return score, "+".join(reasons)
 
-def check_open_trades(tickers):
+# --- FIXED: NOW AN ASYNC FUNCTION ---
+async def check_open_trades(tickers):
     open_trades = get_open_trades()
     if not open_trades: return
 
@@ -239,7 +239,8 @@ def check_market(symbol, yf_ticker):
 async def worker():
     tickers = {"EURUSD": "EURUSD=X", "XAUUSD": "GC=F", "GBPUSD": "GBPUSD=X"}
     while True:
-        check_open_trades(tickers)
+        await check_open_trades(tickers) # Now calling it properly with await
+        
         trades_today, daily_R = get_daily_stats()
         
         if daily_R <= MAX_DAILY_LOSS_R:
