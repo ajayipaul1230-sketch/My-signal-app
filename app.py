@@ -4,45 +4,45 @@ import sqlite3
 import uuid
 import os
 from datetime import datetime, timezone
+import pandas as pd
+import yfinance as yf
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 import uvicorn
-import yfinance as yf
-import pandas as pd
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="super-secret-random-key-123")
 APP_PASSWORD = "secret123" 
 subscribers = set()
 
-# --- RISK SETTINGS ---
 MAX_TRADES_PER_DAY = 4
+SWING_STRENGTH_H1 = 3
+SWING_STRENGTH_H4 = 5
+MIN_SWING_ATR_MULT = 0.6
 
+# --- DB FUNCTIONS ---
 def init_db():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS signals (
             id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, strategy TEXT, 
             dir TEXT, score INTEGER, entry REAL, sl REAL, tp REAL)''')
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
 def save_signal(sig):
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
     c.execute("INSERT INTO signals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", 
               (sig["id"], sig["ts"], sig["symbol"], sig["strategy"], sig["dir"], sig["score"], sig["entry"], sig["sl"], sig["tp"]))
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
 def get_trades_today():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM signals WHERE ts >= date('now')")
     count = c.fetchone()[0]
-    conn.close()
-    return count
+    conn.close(); return count
 
 def get_recent_signals():
     conn = sqlite3.connect("signals.db")
@@ -56,53 +56,109 @@ async def publish(event: str, data: dict):
     for q in list(subscribers):
         await q.put({"event": event, "data": data})
 
-# --- REAL YAHOO FINANCE LOGIC ---
+# --- V2.1 STRATEGY MATH ---
+def find_swings(df, strength, atr_val):
+    """Finds confirmed swing highs/lows based on v2.1 spec (§7)"""
+    highs = df['High'].values
+    lows = df['Low'].values
+    swing_highs = []
+    swing_lows = []
+    
+    # We only look at confirmed swings (strength bars before and after)
+    for i in range(strength, len(df) - strength):
+        # Check Swing High
+        if highs[i] == max(highs[i-strength:i+strength+1]):
+            # Check magnitude filter
+            if (highs[i] - min(lows[i-strength:i+strength+1])) >= (MIN_SWING_ATR_MULT * atr_val):
+                swing_highs.append(highs[i])
+                
+        # Check Swing Low
+        if lows[i] == min(lows[i-strength:i+strength+1]):
+            if (max(highs[i-strength:i+strength+1]) - lows[i]) >= (MIN_SWING_ATR_MULT * atr_val):
+                swing_lows.append(lows[i])
+                
+    return swing_highs, swing_lows
+
+def check_htf_bias(df_h4, current_price, atr_h4):
+    """Checks §7a.1 Hard HTF Bias Filter"""
+    h4_highs, h4_lows = find_swings(df_h4, SWING_STRENGTH_H4, atr_h4)
+    
+    if not h4_highs or not h4_lows:
+        return "neutral", None, None
+
+    last_h4_low = h4_lows[-1]
+    last_h4_high = h4_highs[-1]
+
+    # Long setup: Price must be above the most recent H4 swing low
+    # OR H4 structure making higher lows (simplified to just price > last low for now)
+    if current_price > last_h4_low:
+        long_allowed = True
+    else:
+        long_allowed = False
+
+    # Short setup: Price must be below the most recent H4 swing high
+    if current_price < last_h4_high:
+        short_allowed = True
+    else:
+        short_allowed = False
+
+    if long_allowed and not short_allowed:
+        return "long_only", last_h4_high, last_h4_low
+    elif short_allowed and not long_allowed:
+        return "short_only", last_h4_high, last_h4_low
+    else:
+        return "both", last_h4_high, last_h4_low # Price is inside the range
+
 def check_market(symbol, yf_ticker):
     try:
-        # Fetch 5 days of 1-hour candles
-        df = yf.download(tickers=yf_ticker, period="5d", interval="1h", progress=False, multi_level_index=False)
+        # 1. Download H1 Data (5 days)
+        df_h1 = yf.download(tickers=yf_ticker, period="5d", interval="1h", progress=False, multi_level_index=False)
+        if df_h1.empty: return None
+
+        # 2. Resample H1 to H4 for HTF Bias
+        df_h4 = df_h1.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
+
+        # 3. Calculate ATR (H1)
+        df_h1['TR'] = df_h1['High'] - df_h1['Low']
+        df_h1['ATR'] = df_h1['TR'].rolling(window=14).mean()
+        current_atr = float(df_h1['ATR'].iloc[-1])
+        current_price = float(df_h1['Close'].iloc[-1])
+
+        # 4. Calculate ATR (H4)
+        df_h4['TR'] = df_h4['High'] - df_h4['Low']
+        df_h4['ATR'] = df_h4['TR'].rolling(window=14).mean()
+        atr_h4 = float(df_h4['ATR'].iloc[-1])
+
+        # 5. Find H1 Swings
+        h1_highs, h1_lows = find_swings(df_h1, SWING_STRENGTH_H1, current_atr)
+
+        # 6. Check HTF Bias Filter
+        bias, h4_high, h4_low = check_htf_bias(df_h4, current_price, atr_h4)
+
+        # --- TRIGGER LOGIC ---
+        # For now, we just trigger if a new H1 swing just formed, 
+        # but ONLY in the direction allowed by the H4 Bias.
         
-        if df.empty:
-            print(f"[{symbol}] No data returned from Yahoo.")
-            return None
-
-        # Safely extract the latest price as a float
-        current_price = float(df['Close'].iloc[-1])
-
-        # Calculate RSI (14 period)
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-        current_rsi = float(df['RSI'].iloc[-1])
-
-        # Calculate ATR (14 period)
-        df['TR'] = df['High'] - df['Low']
-        df['ATR'] = df['TR'].rolling(window=14).mean()
-        current_atr = float(df['ATR'].iloc[-1])
-        
-        # Prevent division by zero if the market is completely flat
-        if current_atr == 0:
-            return None
-
-        # --- STRATEGY TRIGGER ---
-        # For now, we use a basic RSI trigger (Oversold < 30, Overbought > 70)
-        # We will replace this with your v2.1 Gartley/AB=CD logic later.
         direction = None
         strategy_name = None
-        
-        if current_rsi < 30:
-            direction = "long"
-            strategy_name = "RSI Oversold"
-        elif current_rsi > 70:
-            direction = "short"
-            strategy_name = "RSI Overbought"
-            
-        if not direction:
-            return None # No setup found
 
-        # Calculate Stop Loss (1.5 ATR) and Take Profit (2.0 ATR)
+        # Basic Breakout Logic for testing the filter
+        if bias in ["long_only", "both"]:
+            # If current price breaks the last H1 swing high
+            if len(h1_highs) > 0 and current_price > h1_highs[-1]:
+                direction = "long"
+                strategy_name = f"Breakout (H4 Bias: {bias})"
+
+        if bias in ["short_only", "both"] and direction is None:
+            # If current price breaks the last H1 swing low
+            if len(h1_lows) > 0 and current_price < h1_lows[-1]:
+                direction = "short"
+                strategy_name = f"Breakout (H4 Bias: {bias})"
+
+        if not direction:
+            return None
+
+        # Calculate SL and TP
         if direction == "long":
             sl = round(current_price - (1.5 * current_atr), 4)
             tp = round(current_price + (2.0 * current_atr), 4)
@@ -123,40 +179,25 @@ def check_market(symbol, yf_ticker):
         }
 
     except Exception as e:
-        # If Yahoo blocks the request or data is malformed, log it and return None (app keeps running)
         print(f"Error checking {symbol}: {e}")
         return None
 
 async def worker():
-    # Map your symbols to Yahoo Finance tickers
-    tickers = {
-        "EURUSD": "EURUSD=X", 
-        "XAUUSD": "GC=F",   # Gold Futures
-        "GBPUSD": "GBPUSD=X"
-    }
-    
+    tickers = {"EURUSD": "EURUSD=X", "XAUUSD": "GC=F", "GBPUSD": "GBPUSD=X"}
     while True:
-        # 1. Check trade limit
-        trades_today = get_trades_today()
-        if trades_today >= MAX_TRADES_PER_DAY:
-            print(f"Daily limit reached ({trades_today}/{MAX_TRADES_PER_DAY}). Sleeping...")
-            await asyncio.sleep(300) # Sleep for 5 minutes to save API calls
+        if get_trades_today() >= MAX_TRADES_PER_DAY:
+            await asyncio.sleep(300)
             continue
 
-        # 2. Scan markets
-        print("Scanning markets...")
+        print("Scanning markets (v2.1 HTF Bias + Swings)...")
         for symbol, ticker in tickers.items():
             sig = check_market(symbol, ticker)
             if sig:
-                print(f"!!! SIGNAL GENERATED: {symbol} {sig['dir']} !!!")
+                print(f"!!! SIGNAL: {symbol} {sig['dir'].upper()} ({sig['strategy']}) !!!")
                 save_signal(sig)
                 await publish("signal", sig)
-                
-                # Check limit again right after a signal, in case we hit 4
-                if get_trades_today() >= MAX_TRADES_PER_DAY:
-                    break
+                if get_trades_today() >= MAX_TRADES_PER_DAY: break
         
-        # Wait 60 seconds before scanning again
         await asyncio.sleep(60)
 
 @app.on_event("startup")
@@ -164,10 +205,9 @@ async def startup():
     init_db()
     asyncio.create_task(worker())
 
-# --- WEB ROUTES ---
+# --- WEB ROUTES (unchanged) ---
 @app.get("/healthz")
-def healthz():
-    return {"status": "ok"}
+def healthz(): return {"status": "ok"}
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page():
@@ -191,8 +231,7 @@ async def do_login(request: Request, password: str = Form(...)):
 @app.get("/stream")
 async def stream(request: Request):
     if not request.session.get("logged_in"): return RedirectResponse(url="/login")
-    q = asyncio.Queue()
-    subscribers.add(q)
+    q = asyncio.Queue(); subscribers.add(q)
     async def gen():
         try:
             while True:
@@ -213,7 +252,7 @@ def index(request: Request):
     if not request.session.get("logged_in"): return RedirectResponse(url="/login")
     return HTMLResponse("""
     <html>
-    <head><title>Real Market Signals</title>
+    <head><title>v2.1 Signals</title>
     <style>
         body { background: #0f1216; color: #e6edf3; font-family: monospace; padding: 20px; }
         .card { border: 1px solid #26303b; padding: 15px; margin-bottom: 10px; border-radius: 6px; background: #171c23; }
@@ -221,8 +260,8 @@ def index(request: Request):
         .row { display: flex; justify-content: space-between; margin-top: 5px; font-size: 12px; color: #8b98a5;}
     </style></head>
     <body>
-        <h2>Live Real Market Signals</h2>
-        <p style="color:#8b98a5; font-size:12px;">Scanning EURUSD, XAUUSD, GBPUSD (Max 4 per day).</p>
+        <h2>v2.1 Live Signals (HTF Bias Filter)</h2>
+        <p style="color:#8b98a5; font-size:12px;">Scanning EURUSD, XAUUSD, GBPUSD (Max 4/day).</p>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');
@@ -236,13 +275,13 @@ def index(request: Request):
             }
             fetch('/api/history').then(r => r.json()).then(data => {
                 list.innerHTML = '';
-                if(data.length === 0) list.innerHTML = "Waiting for market setups (RSI < 30 or > 70)...";
+                if(data.length === 0) list.innerHTML = "Scanning for v2.1 Breakouts...";
                 data.forEach(d => list.appendChild(addCard(d)));
             });
             const es = new EventSource('/stream');
             es.addEventListener('signal', e => {
                 const d = JSON.parse(e.data);
-                if(list.innerText.includes("Waiting")) list.innerHTML = "";
+                if(list.innerText.includes("Scanning")) list.innerHTML = "";
                 list.prepend(addCard(d));
             });
         </script>
