@@ -2,23 +2,19 @@ import asyncio
 import json
 import sqlite3
 import uuid
+import random
+import os
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 import uvicorn
-import yfinance as yf
-import pandas as pd
-import os
-import random
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="super-secret-random-key-123")
 APP_PASSWORD = "secret123" 
-
 subscribers = set()
 
-# --- DATABASE ---
 def init_db():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
@@ -48,90 +44,30 @@ async def publish(event: str, data: dict):
     for q in list(subscribers):
         await q.put({"event": event, "data": data})
 
-# --- REAL STRATEGY LOGIC ---
-def check_market(symbol, yf_ticker):
-    try:
-        # Attempt to download real data
-        df = yf.download(tickers=yf_ticker, period="5d", interval="1h", progress=False)
-        
-        if df.empty:
-            raise ValueError("Empty data returned from Yahoo")
-
-        current_price = float(df['Close'].iloc[-1].item()) if hasattr(df['Close'].iloc[-1], 'item') else float(df['Close'].iloc[-1])
-        
-        # Calculate RSI
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-        current_rsi = float(df['RSI'].iloc[-1].item()) if hasattr(df['RSI'].iloc[-1], 'item') else float(df['RSI'].iloc[-1])
-
-        # Calculate ATR
-        df['TR'] = df['High'] - df['Low']
-        df['ATR'] = df['TR'].rolling(window=14).mean()
-        current_atr = float(df['ATR'].iloc[-1].item()) if hasattr(df['ATR'].iloc[-1], 'item') else float(df['ATR'].iloc[-1])
-        
-        source_tag = ""
-
-    except Exception as e:
-        # FALLBACK: If Yahoo blocks us, don't crash the server. Generate a realistic fake price.
-        print(f"Yahoo Finance error: {e}")
-        current_price = round(random.uniform(1.05, 1.12), 4)
-        current_rsi = random.uniform(20, 80)
-        current_atr = current_price * 0.005
-        source_tag = "[SIMULATED] "
-
-    # Trigger logic
-    direction = None
-    strategy = None
-    
-    if current_rsi < 30:
-        direction = "long"
-        strategy = source_tag + "Oversold (RSI)"
-    elif current_rsi > 70:
-        direction = "short"
-        strategy = source_tag + "Overbought (RSI)"
-        
-    if not direction:
-        return None
-
-    if direction == "long":
-        sl = round(current_price - (1.5 * current_atr), 4)
-        tp = round(current_price + (2.0 * current_atr), 4)
-    else:
-        sl = round(current_price + (1.5 * current_atr), 4)
-        tp = round(current_price - (2.0 * current_atr), 4)
-
-    return {
-        "id": str(uuid.uuid4())[:6],
-        "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-        "symbol": symbol,
-        "strategy": strategy,
-        "dir": direction,
-        "score": 7,
-        "entry": round(current_price, 4),
-        "sl": sl,
-        "tp": tp
-    }
-
 async def worker():
-    tickers = {"EURUSD": "EURUSD=X", "XAUUSD": "GC=F", "GBPUSD": "GBPUSD=X"}
     while True:
-        for symbol, ticker in tickers.items():
-            sig = check_market(symbol, ticker)
-            if sig:
-                save_signal(sig)
-                await publish("signal", sig)
-        
-        await asyncio.sleep(60)
+        await asyncio.sleep(10) # Fast 10-second timer for testing
+        direction = random.choice(["long", "short"])
+        entry = round(random.uniform(1.05, 1.12), 4)
+        sig = {
+            "id": str(uuid.uuid4())[:6],
+            "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "symbol": random.choice(["EURUSD", "XAUUSD", "GBPUSD"]),
+            "strategy": "Test Mode",
+            "dir": direction,
+            "score": 7,
+            "entry": entry,
+            "sl": round(entry - 0.002, 4) if direction=="long" else round(entry + 0.002, 4),
+            "tp": round(entry + 0.004, 4) if direction=="long" else round(entry - 0.004, 4),
+        }
+        save_signal(sig)
+        await publish("signal", sig)
 
 @app.on_event("startup")
 async def startup():
     init_db()
     asyncio.create_task(worker())
 
-# --- WEB ROUTES ---
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
@@ -157,9 +93,7 @@ async def do_login(request: Request, password: str = Form(...)):
 
 @app.get("/stream")
 async def stream(request: Request):
-    if not request.session.get("logged_in"):
-        return RedirectResponse(url="/login")
-        
+    if not request.session.get("logged_in"): return RedirectResponse(url="/login")
     q = asyncio.Queue()
     subscribers.add(q)
     async def gen():
@@ -174,50 +108,42 @@ async def stream(request: Request):
 
 @app.get("/api/history")
 def history(request: Request):
-    if not request.session.get("logged_in"):
-        return []
+    if not request.session.get("logged_in"): return []
     return get_recent_signals()
 
 @app.get("/")
 def index(request: Request):
-    if not request.session.get("logged_in"):
-        return RedirectResponse(url="/login")
-        
+    if not request.session.get("logged_in"): return RedirectResponse(url="/login")
     return HTMLResponse("""
     <html>
-    <head>
-        <title>Real Signals</title>
-        <style>
-            body { background: #0f1216; color: #e6edf3; font-family: monospace; padding: 20px; }
-            .card { border: 1px solid #26303b; padding: 15px; margin-bottom: 10px; border-radius: 6px; background: #171c23; }
-            .long { color: #3fb950; font-weight: bold; } .short { color: #f85149; font-weight: bold; }
-            .row { display: flex; justify-content: space-between; margin-top: 5px; font-size: 12px; color: #8b98a5;}
-        </style>
-    </head>
+    <head><title>Signals</title>
+    <style>
+        body { background: #0f1216; color: #e6edf3; font-family: monospace; padding: 20px; }
+        .card { border: 1px solid #26303b; padding: 15px; margin-bottom: 10px; border-radius: 6px; background: #171c23; }
+        .long { color: #3fb950; font-weight: bold; } .short { color: #f85149; font-weight: bold; }
+        .row { display: flex; justify-content: space-between; margin-top: 5px; font-size: 12px; color: #8b98a5;}
+    </style></head>
     <body>
-        <h2>Live Market Signals</h2>
-        <p style="color:#8b98a5; font-size:12px;">Checks H1 data every 60 seconds.</p>
+        <h2>Live Signals (Test)</h2>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');
             function addCard(d) {
                 const div = document.createElement('div');
                 div.className = 'card';
-                div.innerHTML = `
-                    <div><b>[${d.ts}]</b> ${d.symbol} <span class="${d.dir}">${d.dir.toUpperCase()}</span> | ${d.strategy}</div>
-                    <div class="row"><span>Entry: ${d.entry}</span><span>SL: ${d.sl}</span><span>TP: ${d.tp}</span></div>
-                `;
+                div.innerHTML = `<div><b>[${d.ts}]</b> ${d.symbol} <span class="${d.dir}">${d.dir.toUpperCase()}</span> | ${d.strategy}</div>
+                                 <div class="row"><span>Entry: ${d.entry}</span><span>SL: ${d.sl}</span><span>TP: ${d.tp}</span></div>`;
                 return div;
             }
             fetch('/api/history').then(r => r.json()).then(data => {
                 list.innerHTML = '';
-                if(data.length === 0) list.innerHTML = "Waiting for market data...";
+                if(data.length === 0) list.innerHTML = "Waiting for data...";
                 data.forEach(d => list.appendChild(addCard(d)));
             });
             const es = new EventSource('/stream');
             es.addEventListener('signal', e => {
                 const d = JSON.parse(e.data);
-                if(list.innerText === "Waiting for market data...") list.innerHTML = "";
+                if(list.innerText === "Waiting for data...") list.innerHTML = "";
                 list.prepend(addCard(d));
             });
         </script>
