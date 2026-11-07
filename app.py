@@ -15,6 +15,9 @@ app.add_middleware(SessionMiddleware, secret_key="super-secret-random-key-123")
 APP_PASSWORD = "secret123" 
 subscribers = set()
 
+# --- NEW RISK SETTINGS ---
+MAX_TRADES_PER_DAY = 4
+
 def init_db():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
@@ -32,6 +35,15 @@ def save_signal(sig):
     conn.commit()
     conn.close()
 
+def get_trades_today():
+    conn = sqlite3.connect("signals.db")
+    c = conn.cursor()
+    # Count how many signals were saved today (UTC)
+    c.execute("SELECT COUNT(*) FROM signals WHERE ts >= date('now')")
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
 def get_recent_signals():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
@@ -46,14 +58,29 @@ async def publish(event: str, data: dict):
 
 async def worker():
     while True:
-        await asyncio.sleep(10) # Fast 10-second timer for testing
+        await asyncio.sleep(10) # Fast test timer
+        
+        # 1. Check how many trades we've taken today
+        trades_today = get_trades_today()
+        
+        # 2. If we hit the limit, wait 60 seconds and check again
+        if trades_today >= MAX_TRADES_PER_DAY:
+            print(f"Daily limit reached ({trades_today}/{MAX_TRADES_PER_DAY}). Waiting...")
+            await asyncio.sleep(50) 
+            continue
+
+        # 3. Generate signal
         direction = random.choice(["long", "short"])
         entry = round(random.uniform(1.05, 1.12), 4)
+        
+        # Changed timestamp format to include the Date (YYYY-MM-DD HH:MM:SS)
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        
         sig = {
             "id": str(uuid.uuid4())[:6],
-            "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "ts": now_utc,
             "symbol": random.choice(["EURUSD", "XAUUSD", "GBPUSD"]),
-            "strategy": "Test Mode",
+            "strategy": f"Test {trades_today + 1}/{MAX_TRADES_PER_DAY}",
             "dir": direction,
             "score": 7,
             "entry": entry,
@@ -124,14 +151,16 @@ def index(request: Request):
         .row { display: flex; justify-content: space-between; margin-top: 5px; font-size: 12px; color: #8b98a5;}
     </style></head>
     <body>
-        <h2>Live Signals (Test)</h2>
+        <h2>Live Signals (Max 4 per day)</h2>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');
             function addCard(d) {
                 const div = document.createElement('div');
                 div.className = 'card';
-                div.innerHTML = `<div><b>[${d.ts}]</b> ${d.symbol} <span class="${d.dir}">${d.dir.toUpperCase()}</span> | ${d.strategy}</div>
+                // Extract just the time from the new timestamp format
+                const timeOnly = d.ts.includes(' ') ? d.ts.split(' ')[1] : d.ts;
+                div.innerHTML = `<div><b>[${timeOnly}]</b> ${d.symbol} <span class="${d.dir}">${d.dir.toUpperCase()}</span> | ${d.strategy}</div>
                                  <div class="row"><span>Entry: ${d.entry}</span><span>SL: ${d.sl}</span><span>TP: ${d.tp}</span></div>`;
                 return div;
             }
