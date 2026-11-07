@@ -2,20 +2,21 @@ import asyncio
 import json
 import sqlite3
 import uuid
-import random
 import os
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 import uvicorn
+import yfinance as yf
+import pandas as pd
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="super-secret-random-key-123")
 APP_PASSWORD = "secret123" 
 subscribers = set()
 
-# --- NEW RISK SETTINGS ---
+# --- RISK SETTINGS ---
 MAX_TRADES_PER_DAY = 4
 
 def init_db():
@@ -38,7 +39,6 @@ def save_signal(sig):
 def get_trades_today():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
-    # Count how many signals were saved today (UTC)
     c.execute("SELECT COUNT(*) FROM signals WHERE ts >= date('now')")
     count = c.fetchone()[0]
     conn.close()
@@ -56,45 +56,115 @@ async def publish(event: str, data: dict):
     for q in list(subscribers):
         await q.put({"event": event, "data": data})
 
-async def worker():
-    while True:
-        await asyncio.sleep(10) # Fast test timer
+# --- REAL YAHOO FINANCE LOGIC ---
+def check_market(symbol, yf_ticker):
+    try:
+        # Fetch 5 days of 1-hour candles
+        df = yf.download(tickers=yf_ticker, period="5d", interval="1h", progress=False, multi_level_index=False)
         
-        # 1. Check how many trades we've taken today
-        trades_today = get_trades_today()
-        
-        # 2. If we hit the limit, wait 60 seconds and check again
-        if trades_today >= MAX_TRADES_PER_DAY:
-            print(f"Daily limit reached ({trades_today}/{MAX_TRADES_PER_DAY}). Waiting...")
-            await asyncio.sleep(50) 
-            continue
+        if df.empty:
+            print(f"[{symbol}] No data returned from Yahoo.")
+            return None
 
-        # 3. Generate signal
-        direction = random.choice(["long", "short"])
-        entry = round(random.uniform(1.05, 1.12), 4)
+        # Safely extract the latest price as a float
+        current_price = float(df['Close'].iloc[-1])
+
+        # Calculate RSI (14 period)
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        current_rsi = float(df['RSI'].iloc[-1])
+
+        # Calculate ATR (14 period)
+        df['TR'] = df['High'] - df['Low']
+        df['ATR'] = df['TR'].rolling(window=14).mean()
+        current_atr = float(df['ATR'].iloc[-1])
         
-        # Changed timestamp format to include the Date (YYYY-MM-DD HH:MM:SS)
-        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        # Prevent division by zero if the market is completely flat
+        if current_atr == 0:
+            return None
+
+        # --- STRATEGY TRIGGER ---
+        # For now, we use a basic RSI trigger (Oversold < 30, Overbought > 70)
+        # We will replace this with your v2.1 Gartley/AB=CD logic later.
+        direction = None
+        strategy_name = None
         
-        sig = {
+        if current_rsi < 30:
+            direction = "long"
+            strategy_name = "RSI Oversold"
+        elif current_rsi > 70:
+            direction = "short"
+            strategy_name = "RSI Overbought"
+            
+        if not direction:
+            return None # No setup found
+
+        # Calculate Stop Loss (1.5 ATR) and Take Profit (2.0 ATR)
+        if direction == "long":
+            sl = round(current_price - (1.5 * current_atr), 4)
+            tp = round(current_price + (2.0 * current_atr), 4)
+        else:
+            sl = round(current_price + (1.5 * current_atr), 4)
+            tp = round(current_price - (2.0 * current_atr), 4)
+
+        return {
             "id": str(uuid.uuid4())[:6],
-            "ts": now_utc,
-            "symbol": random.choice(["EURUSD", "XAUUSD", "GBPUSD"]),
-            "strategy": f"Test {trades_today + 1}/{MAX_TRADES_PER_DAY}",
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "strategy": strategy_name,
             "dir": direction,
             "score": 7,
-            "entry": entry,
-            "sl": round(entry - 0.002, 4) if direction=="long" else round(entry + 0.002, 4),
-            "tp": round(entry + 0.004, 4) if direction=="long" else round(entry - 0.004, 4),
+            "entry": round(current_price, 4),
+            "sl": sl,
+            "tp": tp
         }
-        save_signal(sig)
-        await publish("signal", sig)
+
+    except Exception as e:
+        # If Yahoo blocks the request or data is malformed, log it and return None (app keeps running)
+        print(f"Error checking {symbol}: {e}")
+        return None
+
+async def worker():
+    # Map your symbols to Yahoo Finance tickers
+    tickers = {
+        "EURUSD": "EURUSD=X", 
+        "XAUUSD": "GC=F",   # Gold Futures
+        "GBPUSD": "GBPUSD=X"
+    }
+    
+    while True:
+        # 1. Check trade limit
+        trades_today = get_trades_today()
+        if trades_today >= MAX_TRADES_PER_DAY:
+            print(f"Daily limit reached ({trades_today}/{MAX_TRADES_PER_DAY}). Sleeping...")
+            await asyncio.sleep(300) # Sleep for 5 minutes to save API calls
+            continue
+
+        # 2. Scan markets
+        print("Scanning markets...")
+        for symbol, ticker in tickers.items():
+            sig = check_market(symbol, ticker)
+            if sig:
+                print(f"!!! SIGNAL GENERATED: {symbol} {sig['dir']} !!!")
+                save_signal(sig)
+                await publish("signal", sig)
+                
+                # Check limit again right after a signal, in case we hit 4
+                if get_trades_today() >= MAX_TRADES_PER_DAY:
+                    break
+        
+        # Wait 60 seconds before scanning again
+        await asyncio.sleep(60)
 
 @app.on_event("startup")
 async def startup():
     init_db()
     asyncio.create_task(worker())
 
+# --- WEB ROUTES ---
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
@@ -143,7 +213,7 @@ def index(request: Request):
     if not request.session.get("logged_in"): return RedirectResponse(url="/login")
     return HTMLResponse("""
     <html>
-    <head><title>Signals</title>
+    <head><title>Real Market Signals</title>
     <style>
         body { background: #0f1216; color: #e6edf3; font-family: monospace; padding: 20px; }
         .card { border: 1px solid #26303b; padding: 15px; margin-bottom: 10px; border-radius: 6px; background: #171c23; }
@@ -151,14 +221,14 @@ def index(request: Request):
         .row { display: flex; justify-content: space-between; margin-top: 5px; font-size: 12px; color: #8b98a5;}
     </style></head>
     <body>
-        <h2>Live Signals (Max 4 per day)</h2>
+        <h2>Live Real Market Signals</h2>
+        <p style="color:#8b98a5; font-size:12px;">Scanning EURUSD, XAUUSD, GBPUSD (Max 4 per day).</p>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');
             function addCard(d) {
                 const div = document.createElement('div');
                 div.className = 'card';
-                // Extract just the time from the new timestamp format
                 const timeOnly = d.ts.includes(' ') ? d.ts.split(' ')[1] : d.ts;
                 div.innerHTML = `<div><b>[${timeOnly}]</b> ${d.symbol} <span class="${d.dir}">${d.dir.toUpperCase()}</span> | ${d.strategy}</div>
                                  <div class="row"><span>Entry: ${d.entry}</span><span>SL: ${d.sl}</span><span>TP: ${d.tp}</span></div>`;
@@ -166,13 +236,13 @@ def index(request: Request):
             }
             fetch('/api/history').then(r => r.json()).then(data => {
                 list.innerHTML = '';
-                if(data.length === 0) list.innerHTML = "Waiting for data...";
+                if(data.length === 0) list.innerHTML = "Waiting for market setups (RSI < 30 or > 70)...";
                 data.forEach(d => list.appendChild(addCard(d)));
             });
             const es = new EventSource('/stream');
             es.addEventListener('signal', e => {
                 const d = JSON.parse(e.data);
-                if(list.innerText === "Waiting for data...") list.innerHTML = "";
+                if(list.innerText.includes("Waiting")) list.innerHTML = "";
                 list.prepend(addCard(d));
             });
         </script>
