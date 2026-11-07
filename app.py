@@ -16,9 +16,8 @@ app.add_middleware(SessionMiddleware, secret_key="super-secret-random-key-123")
 APP_PASSWORD = "secret123" 
 subscribers = set()
 
-# --- RISK SETTINGS ---
 MAX_TRADES_PER_DAY = 4
-MAX_DAILY_LOSS_R = -2.0  # Stop trading if daily losses hit -2.0R
+MAX_DAILY_LOSS_R = -2.0 
 MIN_SCORE = 7
 SWING_STRENGTH_H1 = 3
 SWING_STRENGTH_H4 = 5
@@ -28,8 +27,9 @@ MIN_SWING_ATR_MULT = 0.6
 def init_db():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
-    # Added status column (OPEN, WIN, LOSS)
-    c.execute('''CREATE TABLE IF NOT EXISTS signals (
+    # CRITICAL FIX: Drop the old table to apply the new 10-column schema
+    c.execute("DROP TABLE IF EXISTS signals")
+    c.execute('''CREATE TABLE signals (
             id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, strategy TEXT, 
             dir TEXT, score INTEGER, entry REAL, sl REAL, tp REAL,
             status TEXT DEFAULT 'OPEN')''')
@@ -58,7 +58,6 @@ def get_open_trades():
     return [{"id": r[0], "symbol": r[2], "dir": r[4], "entry": r[6], "sl": r[7], "tp": r[8]} for r in rows]
 
 def get_daily_stats():
-    """Returns (trades_today, daily_R)"""
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
     c.execute("SELECT COUNT(*), status FROM signals WHERE ts >= date('now') GROUP BY status")
@@ -70,10 +69,8 @@ def get_daily_stats():
     
     for count, status in rows:
         trades_today += count
-        if status == "WIN":
-            daily_R += 1.5 # Assume 1.5R average win for now
-        elif status == "LOSS":
-            daily_R -= 1.0 # 1R loss
+        if status == "WIN": daily_R += 1.5 
+        elif status == "LOSS": daily_R -= 1.0 
             
     return trades_today, daily_R
 
@@ -89,7 +86,7 @@ async def publish(event: str, data: dict):
     for q in list(subscribers):
         await q.put({"event": event, "data": data})
 
-# --- V2.1 MATH (Unchanged) ---
+# --- V2.1 MATH ---
 def find_swings(df, strength, atr_val):
     highs = df['High'].values
     lows = df['Low'].values
@@ -117,10 +114,8 @@ def check_c1c2_rejection(df):
     c1, c2 = df.iloc[-2], df.iloc[-1]
     c1_range = c1['High'] - c1['Low']
     if c1_range == 0: return None
-
     c1_long_valid = ((c1['Close'] - c1['Low']) / c1_range >= 0.75) and (c1['Close'] > c1['Open'])
     if c1_long_valid and (c2['Close'] > c1['High']): return "long"
-
     c1_short_valid = ((c1['High'] - c1['Close']) / c1_range >= 0.75) and (c1['Close'] < c1['Open'])
     if c1_short_valid and (c2['Close'] < c1['Low']): return "short"
     return None
@@ -129,7 +124,6 @@ def detect_abcd(df, direction, atr):
     if len(df) < 10: return False
     highs, lows = find_swings(df, 3, atr)
     if len(highs) < 2 or len(lows) < 2: return False
-
     if direction == "long":
         recent_lows = lows[-2:]
         if len(recent_lows) == 2:
@@ -162,21 +156,16 @@ def calculate_score(df_h1, direction, bias, atr):
         score += 2; reasons.append("AB=CD")
     return score, "+".join(reasons)
 
-# --- TRADE LIFECYCLE & GUARD ---
 def check_open_trades(tickers):
-    """Checks current price against SL and TP of open trades"""
     open_trades = get_open_trades()
     if not open_trades: return
 
     for trade in open_trades:
         try:
-            # Fetch latest 1-minute candle for quick update
             ticker = tickers.get(trade["symbol"])
             if not ticker: continue
-            
             df = yf.download(tickers=ticker, period="1d", interval="1m", progress=False, multi_level_index=False)
             if df.empty: continue
-            
             current_price = float(df['Close'].iloc[-1])
             
             hit_status = None
@@ -192,14 +181,12 @@ def check_open_trades(tickers):
                 update_trade_status(trade["id"], hit_status)
                 await publish("trade_update", {"id": trade["id"], "status": hit_status})
         except Exception as e:
-            pass # Ignore errors on 1m data fetching
+            pass 
 
-# --- MAIN WORKER ---
 def check_market(symbol, yf_ticker):
     try:
         df_h1 = yf.download(tickers=yf_ticker, period="5d", interval="1h", progress=False, multi_level_index=False)
         if df_h1.empty: return None
-
         df_h4 = df_h1.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
 
         df_h1['TR'] = df_h1['High'] - df_h1['Low']
@@ -213,7 +200,6 @@ def check_market(symbol, yf_ticker):
 
         bias = check_htf_bias(df_h4, current_price, atr_h4)
         rejection_dir = check_c1c2_rejection(df_h1)
-        
         if not rejection_dir: return None
         if rejection_dir == "long" and bias not in ["long_only", "both"]: return None
         if rejection_dir == "short" and bias not in ["short_only", "both"]: return None
@@ -231,11 +217,9 @@ def check_market(symbol, yf_ticker):
         risk = abs(current_price - sl)
         reward = abs(tp - current_price)
         rr = reward / risk if risk > 0 else 0
-
         min_rr = 1.40
         if symbol in ["XAUUSD", "BTCUSD"]: min_rr = 1.70
         elif symbol == "USDCAD": min_rr = 1.50
-
         if rr < min_rr: return None
 
         return {
@@ -254,29 +238,24 @@ def check_market(symbol, yf_ticker):
 
 async def worker():
     tickers = {"EURUSD": "EURUSD=X", "XAUUSD": "GC=F", "GBPUSD": "GBPUSD=X"}
-    
     while True:
-        # 1. Check if existing trades hit TP or SL
         check_open_trades(tickers)
-        
-        # 2. Check RiskGuard limits
         trades_today, daily_R = get_daily_stats()
         
         if daily_R <= MAX_DAILY_LOSS_R:
-            print(f"CIRCUIT BREAKER: Daily Loss hit {daily_R}R. Trading halted until tomorrow.")
-            await asyncio.sleep(300) # Sleep 5 mins
+            print(f"CIRCUIT BREAKER: Daily Loss hit {daily_R}R. Trading halted.")
+            await asyncio.sleep(300)
             continue
             
         if trades_today >= MAX_TRADES_PER_DAY:
             await asyncio.sleep(300)
             continue
 
-        # 3. Scan for new setups
-        print(f"Scanning markets... (Trades today: {trades_today}/4 | Daily R: {daily_R})")
+        print(f"Scanning... (Trades: {trades_today}/4 | R: {daily_R})")
         for symbol, ticker in tickers.items():
             sig = check_market(symbol, ticker)
             if sig:
-                print(f"!!! NEW SIGNAL: {symbol} {sig['dir'].upper()} | {sig['strategy']} !!!")
+                print(f"!!! NEW SIGNAL: {symbol} {sig['dir'].upper()} !!!")
                 save_signal(sig)
                 await publish("signal", sig)
                 if get_daily_stats()[0] >= MAX_TRADES_PER_DAY: break
