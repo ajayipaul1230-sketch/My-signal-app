@@ -18,8 +18,9 @@ APP_PASSWORD = "secret123"
 subscribers = set()
 
 # --- TELEGRAM SETTINGS ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN = os.environ.get("8927484419:AAHAY0-X77GkBv13hQeCIcTRo39WT-X3C3E
+", "")
+TELEGRAM_CHAT_ID = os.environ.get("7185853274", "")
 
 MAX_TRADES_PER_DAY = 4
 MAX_DAILY_LOSS_R = -2.0 
