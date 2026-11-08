@@ -5,7 +5,6 @@ import uuid
 import os
 from datetime import datetime, timezone
 import pandas as pd
-import yfinance as yf
 import httpx
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
@@ -17,9 +16,10 @@ app.add_middleware(SessionMiddleware, secret_key="super-secret-random-key-123")
 APP_PASSWORD = "secret123" 
 subscribers = set()
 
-# --- FIXED: .strip() removes any hidden \n or spaces from copy-pasting ---
+# --- API & TELEGRAM SETTINGS ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
 
 MAX_TRADES_PER_DAY = 4
 MAX_DAILY_LOSS_R = -2.0 
@@ -28,7 +28,7 @@ SWING_STRENGTH_H1 = 3
 SWING_STRENGTH_H4 = 5
 MIN_SWING_ATR_MULT = 0.6
 
-# --- DB FUNCTIONS ---
+# --- DB FUNCTIONS (Unchanged) ---
 def init_db():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
@@ -88,22 +88,58 @@ async def publish(event: str, data: dict):
         await q.put({"event": event, "data": data})
 
 async def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured. Skipping alert.")
-        return
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     async with httpx.AsyncClient() as client:
         try:
-            r = await client.post(url, json=payload)
-            if r.status_code != 200:
-                print(f"Telegram API Error: {r.text}")
-            else:
-                print("Telegram message sent successfully!")
+            await client.post(url, json=payload)
         except Exception as e:
-            print(f"Telegram connection error: {e}")
+            print(f"Telegram error: {e}")
 
-# --- V2.1 MATH ---
+# --- REAL-TIME DATA FETCHER (TwelveData) ---
+async def fetch_candles(symbol, interval, outputsize=30):
+    """Fetches real-time candles from TwelveData"""
+    if not TWELVEDATA_API_KEY:
+        print("ERROR: TWELVEDATA_API_KEY is missing!")
+        return pd.DataFrame()
+        
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVEDATA_API_KEY,
+        "format": "JSON"
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.get(url, params=params)
+            data = r.json()
+            
+            if "values" not in data:
+                print(f"TwelveData Error for {symbol}: {data}")
+                return pd.DataFrame()
+            
+            # Convert JSON to Pandas DataFrame
+            df = pd.DataFrame(data["values"])
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df.set_index('datetime', inplace=True)
+            # TwelveData returns newest first. Reverse to oldest first.
+            df = df.iloc[::-1]
+            
+            # Convert strings to floats
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = df[col].astype(float)
+                
+            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+            return df
+        except Exception as e:
+            print(f"Fetch Error: {e}")
+            return pd.DataFrame()
+
+# --- V2.1 MATH (Unchanged) ---
 def find_swings(df, strength, atr_val):
     highs = df['High'].values
     lows = df['Low'].values
@@ -180,8 +216,11 @@ async def check_open_trades(tickers):
         try:
             ticker = tickers.get(trade["symbol"])
             if not ticker: continue
-            df = yf.download(tickers=ticker, period="1d", interval="1m", progress=False, multi_level_index=False)
+            
+            # Fetch 1-minute real-time data for open trades
+            df = await fetch_candles(ticker, "1min", outputsize=5)
             if df.empty: continue
+            
             current_price = float(df['Close'].iloc[-1])
             
             hit_status = None
@@ -200,10 +239,13 @@ async def check_open_trades(tickers):
         except Exception as e:
             pass 
 
-def check_market(symbol, yf_ticker):
+async def check_market(symbol, api_ticker):
     try:
-        df_h1 = yf.download(tickers=yf_ticker, period="5d", interval="1h", progress=False, multi_level_index=False)
+        # Fetch H1 data
+        df_h1 = await fetch_candles(api_ticker, "1h", outputsize=50)
         if df_h1.empty: return None
+        
+        # Resample H1 to H4
         df_h4 = df_h1.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
 
         df_h1['TR'] = df_h1['High'] - df_h1['Low']
@@ -251,32 +293,35 @@ def check_market(symbol, yf_ticker):
             "tp": tp
         }
     except Exception as e:
+        print(f"Check market error {symbol}: {e}")
         return None
 
 async def worker():
-    tickers = {"EURUSD": "EURUSD=X", "XAUUSD": "GC=F", "GBPUSD": "GBPUSD=X"}
+    # TwelveData uses specific ticker formats
+    tickers = {
+        "EURUSD": "EUR/USD", 
+        "XAUUSD": "XAU/USD", 
+        "GBPUSD": "GBP/USD"
+    }
     
     print("Checking Telegram configuration...")
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram("🤖 <b>Trading Bot Online!</b>\nYour dashboard is now connected to Telegram.")
-    else:
-        print("Telegram Token or Chat ID missing in Environment Variables.")
+        await send_telegram("🤖 <b>Trading Bot Online!</b>\nSwitched to Real-Time TwelveData API.")
 
     while True:
+        # 1. Update Open Trades
         await check_open_trades(tickers)
-        trades_today, daily_R = get_daily_stats()
         
-        if daily_R <= MAX_DAILY_LOSS_R:
-            await asyncio.sleep(300)
-            continue
-            
-        if trades_today >= MAX_TRADES_PER_DAY:
-            await asyncio.sleep(300)
+        # 2. Check Risk limits
+        trades_today, daily_R = get_daily_stats()
+        if daily_R <= MAX_DAILY_LOSS_R or trades_today >= MAX_TRADES_PER_DAY:
+            await asyncio.sleep(300) # Sleep 5 mins if limit hit
             continue
 
-        print(f"Scanning... (Trades: {trades_today}/4 | R: {daily_R})")
-        for symbol, ticker in tickers.items():
-            sig = check_market(symbol, ticker)
+        # 3. Scan for new setups
+        print(f"Scanning real-time markets... (Trades: {trades_today}/4 | R: {daily_R})")
+        for symbol, api_ticker in tickers.items():
+            sig = await check_market(symbol, api_ticker)
             if sig:
                 print(f"!!! NEW SIGNAL: {symbol} {sig['dir'].upper()} !!!")
                 save_signal(sig)
@@ -293,6 +338,7 @@ async def worker():
 
                 if get_daily_stats()[0] >= MAX_TRADES_PER_DAY: break
         
+        # Wait 60 seconds before next scan
         await asyncio.sleep(60)
 
 @app.on_event("startup")
@@ -300,7 +346,7 @@ async def startup():
     init_db()
     asyncio.create_task(worker())
 
-# --- WEB ROUTES ---
+# --- WEB ROUTES (Unchanged) ---
 @app.get("/healthz")
 def healthz(): return {"status": "ok"}
 
@@ -359,7 +405,7 @@ def index(request: Request):
         .bg-loss { background: #da3633; color: white; }
     </style></head>
     <body>
-        <h2>v2.1 Live Signals (Telegram Active)</h2>
+        <h2>v2.1 Live Signals (Real-Time API)</h2>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');
