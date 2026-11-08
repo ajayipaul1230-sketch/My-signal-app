@@ -22,6 +22,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 
+# --- RISK & PORTFOLIO SETTINGS ---
+ACCOUNT_BALANCE = 10000.0   # Set this to your prop firm account size
+RISK_PER_TRADE = 0.0025     # 0.25% (The exact v2.1 Forward-Test hard cap)
+MAX_OPEN_TRADES = 2         # Prevents correlation wipeout
+
 MAX_TRADES_PER_DAY = 4
 MAX_DAILY_LOSS_R = -2.0 
 MIN_SCORE = 7
@@ -98,13 +103,12 @@ async def send_telegram(message):
         except Exception as e:
             print(f"Telegram error: {e}")
 
-# --- ECONOMIC NEWS FILTER (§13) ---
+# --- ECONOMIC NEWS FILTER ---
 async def check_news_blackout():
     if not FINNHUB_API_KEY: return False
     now = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
     url = f"https://finnhub.io/api/v1/calendar/economic?from={today}&to={today}&token={FINNHUB_API_KEY}"
-    
     async with httpx.AsyncClient() as client:
         try:
             r = await client.get(url)
@@ -156,7 +160,6 @@ def get_alternating_swings(df, strength, atr_val):
         if lows[i] == min(lows[i-strength:i+strength+1]):
             if (max(highs[i-strength:i+strength+1]) - lows[i]) >= (MIN_SWING_ATR_MULT * atr_val):
                 raw_swings.append({"type": "L", "price": lows[i], "idx": i})
-                
     clean_swings = []
     for s in raw_swings:
         if not clean_swings: clean_swings.append(s)
@@ -231,75 +234,45 @@ def calculate_score(df_h1, direction, bias, atr):
                 score += 2; reasons.append("AB=CD")
     return score, "+".join(reasons)
 
-# --- BIG MO MODULE (§9.7 & §12) ---
 async def check_big_mo(symbol, api_ticker):
     try:
-        # Big Mo uses the 120-min (2h) chart
         df_h2 = await fetch_candles(api_ticker, "2h", outputsize=50)
         if df_h2.empty or len(df_h2) < 20: return None
-        
-        # Calculate Big Mo (EMA 89) and Master Mo (EMA 200)
         df_h2['EMA89'] = df_h2['Close'].ewm(span=89, adjust=False).mean()
         df_h2['EMA200'] = df_h2['Close'].ewm(span=200, adjust=False).mean()
-        
-        # ATR(7) for the breakout distance check
         df_h2['TR'] = df_h2['High'] - df_h2['Low']
         df_h2['ATR7'] = df_h2['TR'].rolling(window=7).mean()
-        
-        # ATR(120) for the stop/target placement
         df_h2['ATR120'] = df_h2['TR'].rolling(window=120).mean()
-        
-        # If not enough data for ATR120, fallback to standard ATR
-        if pd.isna(df_h2['ATR120'].iloc[-1]):
-            df_h2['ATR120'] = df_h2['ATR7']
+        if pd.isna(df_h2['ATR120'].iloc[-1]): df_h2['ATR120'] = df_h2['ATR7']
 
         c1, c2 = df_h2.iloc[-2], df_h2.iloc[-1]
         current_atr7 = float(df_h2['ATR7'].iloc[-1])
         current_atr120 = float(df_h2['ATR120'].iloc[-1])
         current_price = float(c2['Close'])
-        
         big_mo = float(c2['EMA89'])
         master_mo = float(c2['EMA200'])
-        
-        # Minimum breakout distance (0.30 x ATR7)
         min_dist = 0.30 * current_atr7
 
         direction = None
-        
-        # Long Trigger: Close > both EMAs + min_dist
         if c2['Close'] > big_mo and c2['Close'] > master_mo:
-            if (c2['Close'] - max(big_mo, master_mo)) >= min_dist:
-                direction = "long"
-                
-        # Short Trigger: Close < both EMAs - min_dist
+            if (c2['Close'] - max(big_mo, master_mo)) >= min_dist: direction = "long"
         elif c2['Close'] < big_mo and c2['Close'] < master_mo:
-            if (min(big_mo, master_mo) - c2['Close']) >= min_dist:
-                direction = "short"
+            if (min(big_mo, master_mo) - c2['Close']) >= min_dist: direction = "short"
 
         if not direction: return None
-
-        # Stops and Targets (§10.2 Big Mo: TP1 = 2 ATR, TP2 = 4 ATR)
         if direction == "long":
-            sl = round(current_price - current_atr120, 4) # Simple structural stop proxy
+            sl = round(current_price - current_atr120, 4)
             tp = round(current_price + (2.0 * current_atr120), 4)
         else:
             sl = round(current_price + current_atr120, 4)
             tp = round(current_price - (2.0 * current_atr120), 4)
 
         return {
-            "id": str(uuid.uuid4())[:6],
-            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol": symbol,
-            "strategy": "EMA89_PB_v0.1 - Experimental",
-            "dir": direction,
-            "score": 10, # Fixed high score for experimental
-            "entry": round(current_price, 4),
-            "sl": sl,
-            "tp": tp
+            "id": str(uuid.uuid4())[:6], "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol, "strategy": "EMA89_PB_v0.1 - Experimental", "dir": direction,
+            "score": 10, "entry": round(current_price, 4), "sl": sl, "tp": tp
         }
-    except Exception as e:
-        print(f"Big Mo error {symbol}: {e}")
-        return None
+    except: return None
 
 async def check_open_trades(tickers):
     open_trades = get_open_trades()
@@ -335,27 +308,22 @@ async def check_market(symbol, api_ticker):
         df_h1['ATR'] = df_h1['TR'].rolling(window=14).mean()
         current_atr = float(df_h1['ATR'].iloc[-1])
         current_price = float(df_h1['Close'].iloc[-1])
-
         df_h4['TR'] = df_h4['High'] - df_h4['Low']
         df_h4['ATR'] = df_h4['TR'].rolling(window=14).mean()
         atr_h4 = float(df_h4['ATR'].iloc[-1])
-
         bias = check_htf_bias(df_h4, current_price, atr_h4)
         rejection_dir = check_c1c2_rejection(df_h1)
         if not rejection_dir: return None
         if rejection_dir == "long" and bias not in ["long_only", "both"]: return None
         if rejection_dir == "short" and bias not in ["short_only", "both"]: return None
-
         score, reason_string = calculate_score(df_h1, rejection_dir, bias, current_atr)
         if score < MIN_SCORE: return None
-
         if rejection_dir == "long":
             sl = round(current_price - (1.5 * current_atr), 4)
             tp = round(current_price + (2.0 * current_atr), 4)
         else:
             sl = round(current_price + (1.5 * current_atr), 4)
             tp = round(current_price - (2.0 * current_atr), 4)
-
         risk = abs(current_price - sl)
         reward = abs(tp - current_price)
         rr = reward / risk if risk > 0 else 0
@@ -363,34 +331,38 @@ async def check_market(symbol, api_ticker):
         if symbol in ["XAUUSD", "BTCUSD"]: min_rr = 1.70
         elif symbol == "USDCAD": min_rr = 1.50
         if rr < min_rr: return None
-
         return {
-            "id": str(uuid.uuid4())[:6],
-            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol": symbol,
-            "strategy": f"Score {score}/12 ({reason_string})",
-            "dir": rejection_dir,
-            "score": score,
-            "entry": round(current_price, 4),
-            "sl": sl,
-            "tp": tp
+            "id": str(uuid.uuid4())[:6], "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol, "strategy": f"Score {score}/12 ({reason_string})", "dir": rejection_dir,
+            "score": score, "entry": round(current_price, 4), "sl": sl, "tp": tp
         }
-    except Exception: return None
+    except: return None
 
 async def worker():
-    # Main system tickers
-    tickers = {"EURUSD": "EUR/USD", "XAUUSD": "XAU/USD", "GBPUSD": "GBP/USD"}
-    
-    # Big Mo allowed tickers (§3: AUDUSD, EURUSD, GBPUSD, USDJPY, EURGBP)
+    # EXPANDED WATCHLIST FOR FASTER SAMPLE SIZE
+    tickers = {
+        "EURUSD": "EUR/USD", 
+        "GBPUSD": "GBP/USD", 
+        "XAUUSD": "XAU/USD",
+        "AUDUSD": "AUD/USD",
+        "USDJPY": "USD/JPY"
+    }
     big_mo_tickers = {"EURUSD": "EUR/USD", "GBPUSD": "GBP/USD"}
-    
+
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram("🤖 <b>Trading Bot Online!</b>\nBig Mo (EMA89 Experimental) is ACTIVE.")
+        await send_telegram("🤖 <b>Bot Online! (Portfolio Mode)</b>\nExpanded to 5 pairs. Risk is locked at 0.25%.")
 
     while True:
         await check_open_trades(tickers)
         trades_today, daily_R = get_daily_stats()
         
+        # --- CORRELATION & RISK LIMITS ---
+        open_trades = get_open_trades()
+        if len(open_trades) >= MAX_OPEN_TRADES:
+            print(f"Max concurrent trades reached ({len(open_trades)}/{MAX_OPEN_TRADES}). Waiting...")
+            await asyncio.sleep(300)
+            continue
+
         if daily_R <= MAX_DAILY_LOSS_R or trades_today >= MAX_TRADES_PER_DAY:
             await asyncio.sleep(300)
             continue
@@ -400,13 +372,12 @@ async def worker():
             await asyncio.sleep(300)
             continue
 
-        # Check current UTC hour for Big Mo time window (08:00 to 12:00)
         current_hour = datetime.now(timezone.utc).hour
         is_big_mo_time = 8 <= current_hour < 12
 
-        print(f"Scanning... (Trades: {trades_today}/4 | R: {daily_R} | Big Mo Active: {is_big_mo_time})")
+        print(f"Scanning... (Trades: {trades_today}/4 | R: {daily_R} | Open: {len(open_trades)})")
         
-        # 1. Run Big Mo (if time window allows)
+        # Run Big Mo
         if is_big_mo_time:
             for symbol, api_ticker in big_mo_tickers.items():
                 sig = await check_big_mo(symbol, api_ticker)
@@ -414,31 +385,38 @@ async def worker():
                     save_signal(sig)
                     await publish("signal", sig)
                     emoji = "🟢" if sig['dir'] == 'long' else "🔴"
-                    msg = (f"{emoji} <b>NEW SIGNAL: {sig['symbol']}</b>\n"
+                    risk_usd = ACCOUNT_BALANCE * RISK_PER_TRADE
+                    msg = (f"{emoji} <b>BIG MO: {sig['symbol']}</b>\n"
                            f"Direction: {sig['dir'].upper()}\n"
                            f"Entry: {sig['entry']}\n"
                            f"SL: {sig['sl']}\n"
                            f"TP: {sig['tp']}\n"
+                           f"Risk: ${risk_usd:.2f} (0.25%)\n"
                            f"{sig['strategy']}")
                     await send_telegram(msg)
                     if get_daily_stats()[0] >= MAX_TRADES_PER_DAY: break
         
-        # 2. Run Main System (if trade limit not reached)
-        if get_daily_stats()[0] < MAX_TRADES_PER_DAY:
+        # Run Main System
+        if get_daily_stats()[0] < MAX_TRADES_PER_DAY and len(get_open_trades()) < MAX_OPEN_TRADES:
             for symbol, api_ticker in tickers.items():
                 sig = await check_market(symbol, api_ticker)
                 if sig:
                     save_signal(sig)
                     await publish("signal", sig)
                     emoji = "🟢" if sig['dir'] == 'long' else "🔴"
+                    risk_usd = ACCOUNT_BALANCE * RISK_PER_TRADE
                     msg = (f"{emoji} <b>NEW SIGNAL: {sig['symbol']}</b>\n"
                            f"Direction: {sig['dir'].upper()}\n"
                            f"Entry: {sig['entry']}\n"
                            f"SL: {sig['sl']}\n"
                            f"TP: {sig['tp']}\n"
+                           f"Risk: ${risk_usd:.2f} (0.25%)\n"
                            f"{sig['strategy']}")
                     await send_telegram(msg)
-                    if get_daily_stats()[0] >= MAX_TRADES_PER_DAY: break
+                    
+                    # Stop scanning this loop if we hit max open limits
+                    if get_daily_stats()[0] >= MAX_TRADES_PER_DAY or len(get_open_trades()) >= MAX_OPEN_TRADES: 
+                        break
         
         await asyncio.sleep(60)
 
@@ -506,7 +484,7 @@ def index(request: Request):
         .bg-loss { background: #da3633; color: white; }
     </style></head>
     <body>
-        <h2>v2.1 Live Signals (Big Mo Active)</h2>
+        <h2>v2.1 Live Signals (Portfolio Mode)</h2>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');
