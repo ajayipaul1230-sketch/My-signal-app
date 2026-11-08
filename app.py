@@ -32,7 +32,6 @@ MIN_SWING_ATR_MULT = 0.6
 def init_db():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
-    c.execute("DROP TABLE IF EXISTS signals") 
     c.execute('''CREATE TABLE signals (
             id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, strategy TEXT, 
             dir TEXT, score INTEGER, entry REAL, sl REAL, tp REAL,
