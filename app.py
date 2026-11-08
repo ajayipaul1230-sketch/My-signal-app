@@ -100,9 +100,7 @@ async def send_telegram(message):
 
 # --- ECONOMIC NEWS FILTER (§13) ---
 async def check_news_blackout():
-    """Checks if we are within 30 mins before or 45 mins after high-impact USD news"""
     if not FINNHUB_API_KEY: return False
-    
     now = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
     url = f"https://finnhub.io/api/v1/calendar/economic?from={today}&to={today}&token={FINNHUB_API_KEY}"
@@ -112,19 +110,18 @@ async def check_news_blackout():
             r = await client.get(url)
             data = r.json()
             if "economicCalendar" not in data: return False
-            
             for event in data["economicCalendar"]:
-                # Only care about USD and High Impact
-                if event.get("country") == "US" and event.get("impact") == "high":
-                    event_time = datetime.fromisoformat(event["time"]).replace(tzinfo=timezone.utc)
-                    diff = (event_time - now).total_seconds() / 60.0
-                    
-                    # 30 mins before (diff >= -30) and 45 mins after (diff <= 45)
-                    if -45 <= diff <= 30:
-                        print(f"NEWS BLACKOUT: {event['event']} in {diff} mins.")
-                        return True
-        except Exception as e:
-            print(f"News API error: {e}")
+                if event.get("country") == "US" and str(event.get("impact", "")).lower() == "high":
+                    time_str = event.get("time")
+                    if not time_str: continue
+                    try:
+                        event_time = datetime.fromisoformat(time_str.replace(" ", "T")).replace(tzinfo=timezone.utc)
+                        diff = (event_time - now).total_seconds() / 60.0
+                        if -45 <= diff <= 30:
+                            print(f"NEWS BLACKOUT: {event.get('event')} in {diff} mins.")
+                            return True
+                    except: continue
+        except: pass
     return False
 
 # --- REAL-TIME DATA FETCHER ---
@@ -145,16 +142,13 @@ async def fetch_candles(symbol, interval, outputsize=50):
                 df[col] = df[col].astype(float)
             df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
             return df
-        except:
-            return pd.DataFrame()
+        except: return pd.DataFrame()
 
 # --- V2.1 TRUE HARMONIC MATH ---
 def get_alternating_swings(df, strength, atr_val):
-    """Finds the last 5 alternating swing points (X, A, B, C, D)"""
     highs = df['High'].values
     lows = df['Low'].values
     raw_swings = []
-    
     for i in range(strength, len(df) - strength):
         if highs[i] == max(highs[i-strength:i+strength+1]):
             if (highs[i] - min(lows[i-strength:i+strength+1])) >= (MIN_SWING_ATR_MULT * atr_val):
@@ -163,20 +157,15 @@ def get_alternating_swings(df, strength, atr_val):
             if (max(highs[i-strength:i+strength+1]) - lows[i]) >= (MIN_SWING_ATR_MULT * atr_val):
                 raw_swings.append({"type": "L", "price": lows[i], "idx": i})
                 
-    # Clean up: ensure alternates (H, L, H, L)
     clean_swings = []
     for s in raw_swings:
-        if not clean_swings:
-            clean_swings.append(s)
+        if not clean_swings: clean_swings.append(s)
         else:
             last = clean_swings[-1]
             if s["type"] == last["type"]:
-                # If same type, keep the more extreme one
                 if (s["type"] == "H" and s["price"] > last["price"]) or (s["type"] == "L" and s["price"] < last["price"]):
                     clean_swings[-1] = s
-            else:
-                clean_swings.append(s)
-                
+            else: clean_swings.append(s)
     return clean_swings[-5:] if len(clean_swings) >= 5 else []
 
 def check_htf_bias(df_h4, current_price, atr_h4):
@@ -185,7 +174,6 @@ def check_htf_bias(df_h4, current_price, atr_h4):
     highs = [s["price"] for s in swings if s["type"] == "H"]
     lows = [s["price"] for s in swings if s["type"] == "L"]
     if not highs or not lows: return "neutral"
-    
     long_allowed = current_price > lows[-1]
     short_allowed = current_price < highs[-1]
     if long_allowed and not short_allowed: return "long_only"
@@ -204,42 +192,23 @@ def check_c1c2_rejection(df):
     return None
 
 def detect_harmonic(df, direction, atr):
-    """Detects True Bat (88.6%) and Gartley (78.6%) patterns"""
     swings = get_alternating_swings(df, 3, atr)
     if len(swings) < 5: return None
-    
     X, A, B, C, D = swings
-    
-    # Must end at D (the current price action)
     if direction == "long" and D["type"] != "L": return None
     if direction == "short" and D["type"] != "H": return None
-    
     XA = abs(A["price"] - X["price"])
     AB = abs(B["price"] - A["price"])
-    BC = abs(C["price"] - B["price"])
     AD = abs(D["price"] - X["price"])
-    
     if XA == 0: return None
-    
-    # Ratios
-    ab_xa = AB / XA
-    ad_xa = AD / XA
-    
-    # Bat Pattern (§9.3): AB 38.2-50%, D = 88.6%
-    if 0.35 <= ab_xa <= 0.55 and abs(ad_xa - 0.886) <= FIB_TOLERANCE:
-        return "Bat"
-        
-    # Gartley Pattern (§9.4): AB 61.8-78.6%, D = 78.6%
-    if 0.60 <= ab_xa <= 0.80 and abs(ad_xa - 0.786) <= FIB_TOLERANCE:
-        return "Gartley"
-        
+    ab_xa, ad_xa = AB / XA, AD / XA
+    if 0.35 <= ab_xa <= 0.55 and abs(ad_xa - 0.886) <= FIB_TOLERANCE: return "Bat"
+    if 0.60 <= ab_xa <= 0.80 and abs(ad_xa - 0.786) <= FIB_TOLERANCE: return "Gartley"
     return None
 
 def calculate_score(df_h1, direction, bias, atr):
     score = 0
     reasons = []
-    
-    # 1. RSI (1 Point)
     delta = df_h1['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -247,26 +216,90 @@ def calculate_score(df_h1, direction, bias, atr):
     current_rsi = float((100 - (100 / (1 + rs))).iloc[-1])
     if (direction == "long" and current_rsi < 20) or (direction == "short" and current_rsi > 80):
         score += 1; reasons.append("RSI")
-        
-    # 2. Structure (2 Points)
     if (direction == "long" and bias in ["long_only", "both"]) or \
        (direction == "short" and bias in ["short_only", "both"]):
         score += 2; reasons.append("Struct")
-        
-    # 3. Harmonic Pattern (3 Points) - Advanced Pattern
     harmonic = detect_harmonic(df_h1, direction, atr)
     if harmonic:
         score += 3; reasons.append(harmonic)
     else:
-        # If no harmonic, check basic AB=CD (2 Points)
         swings = get_alternating_swings(df_h1, 3, atr)
         if len(swings) == 5:
             ab_leg = abs(swings[1]["price"] - swings[0]["price"])
             cd_leg = abs(swings[3]["price"] - swings[2]["price"])
             if ab_leg > 0 and 0.9 <= (cd_leg / ab_leg) <= 1.1:
                 score += 2; reasons.append("AB=CD")
-                
     return score, "+".join(reasons)
+
+# --- BIG MO MODULE (§9.7 & §12) ---
+async def check_big_mo(symbol, api_ticker):
+    try:
+        # Big Mo uses the 120-min (2h) chart
+        df_h2 = await fetch_candles(api_ticker, "2h", outputsize=50)
+        if df_h2.empty or len(df_h2) < 20: return None
+        
+        # Calculate Big Mo (EMA 89) and Master Mo (EMA 200)
+        df_h2['EMA89'] = df_h2['Close'].ewm(span=89, adjust=False).mean()
+        df_h2['EMA200'] = df_h2['Close'].ewm(span=200, adjust=False).mean()
+        
+        # ATR(7) for the breakout distance check
+        df_h2['TR'] = df_h2['High'] - df_h2['Low']
+        df_h2['ATR7'] = df_h2['TR'].rolling(window=7).mean()
+        
+        # ATR(120) for the stop/target placement
+        df_h2['ATR120'] = df_h2['TR'].rolling(window=120).mean()
+        
+        # If not enough data for ATR120, fallback to standard ATR
+        if pd.isna(df_h2['ATR120'].iloc[-1]):
+            df_h2['ATR120'] = df_h2['ATR7']
+
+        c1, c2 = df_h2.iloc[-2], df_h2.iloc[-1]
+        current_atr7 = float(df_h2['ATR7'].iloc[-1])
+        current_atr120 = float(df_h2['ATR120'].iloc[-1])
+        current_price = float(c2['Close'])
+        
+        big_mo = float(c2['EMA89'])
+        master_mo = float(c2['EMA200'])
+        
+        # Minimum breakout distance (0.30 x ATR7)
+        min_dist = 0.30 * current_atr7
+
+        direction = None
+        
+        # Long Trigger: Close > both EMAs + min_dist
+        if c2['Close'] > big_mo and c2['Close'] > master_mo:
+            if (c2['Close'] - max(big_mo, master_mo)) >= min_dist:
+                direction = "long"
+                
+        # Short Trigger: Close < both EMAs - min_dist
+        elif c2['Close'] < big_mo and c2['Close'] < master_mo:
+            if (min(big_mo, master_mo) - c2['Close']) >= min_dist:
+                direction = "short"
+
+        if not direction: return None
+
+        # Stops and Targets (§10.2 Big Mo: TP1 = 2 ATR, TP2 = 4 ATR)
+        if direction == "long":
+            sl = round(current_price - current_atr120, 4) # Simple structural stop proxy
+            tp = round(current_price + (2.0 * current_atr120), 4)
+        else:
+            sl = round(current_price + current_atr120, 4)
+            tp = round(current_price - (2.0 * current_atr120), 4)
+
+        return {
+            "id": str(uuid.uuid4())[:6],
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "strategy": "EMA89_PB_v0.1 - Experimental",
+            "dir": direction,
+            "score": 10, # Fixed high score for experimental
+            "entry": round(current_price, 4),
+            "sl": sl,
+            "tp": tp
+        }
+    except Exception as e:
+        print(f"Big Mo error {symbol}: {e}")
+        return None
 
 async def check_open_trades(tickers):
     open_trades = get_open_trades()
@@ -291,14 +324,12 @@ async def check_open_trades(tickers):
                 update_trade_status(trade["id"], hit_status)
                 await publish("trade_update", {"id": trade["id"], "status": hit_status})
                 await send_telegram(f"🏁 <b>TRADE CLOSED: {trade['symbol']}</b>\nResult: {hit_status}")
-        except Exception:
-            pass 
+        except Exception: pass 
 
 async def check_market(symbol, api_ticker):
     try:
         df_h1 = await fetch_candles(api_ticker, "1h", outputsize=50)
         if df_h1.empty: return None
-        
         df_h4 = df_h1.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
         df_h1['TR'] = df_h1['High'] - df_h1['Low']
         df_h1['ATR'] = df_h1['TR'].rolling(window=14).mean()
@@ -344,14 +375,17 @@ async def check_market(symbol, api_ticker):
             "sl": sl,
             "tp": tp
         }
-    except Exception:
-        return None
+    except Exception: return None
 
 async def worker():
+    # Main system tickers
     tickers = {"EURUSD": "EUR/USD", "XAUUSD": "XAU/USD", "GBPUSD": "GBP/USD"}
     
+    # Big Mo allowed tickers (§3: AUDUSD, EURUSD, GBPUSD, USDJPY, EURGBP)
+    big_mo_tickers = {"EURUSD": "EUR/USD", "GBPUSD": "GBP/USD"}
+    
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram("🤖 <b>Trading Bot Online!</b>\nNews Filter and True Harmonics are ACTIVE.")
+        await send_telegram("🤖 <b>Trading Bot Online!</b>\nBig Mo (EMA89 Experimental) is ACTIVE.")
 
     while True:
         await check_open_trades(tickers)
@@ -361,29 +395,50 @@ async def worker():
             await asyncio.sleep(300)
             continue
 
-        # Check for News Blackout (§13)
         is_blackout = await check_news_blackout()
         if is_blackout:
             await asyncio.sleep(300)
             continue
 
-        print(f"Scanning real-time markets... (Trades: {trades_today}/4 | R: {daily_R})")
-        for symbol, api_ticker in tickers.items():
-            sig = await check_market(symbol, api_ticker)
-            if sig:
-                save_signal(sig)
-                await publish("signal", sig)
-                
-                emoji = "🟢" if sig['dir'] == 'long' else "🔴"
-                msg = (f"{emoji} <b>NEW SIGNAL: {sig['symbol']}</b>\n"
-                       f"Direction: {sig['dir'].upper()}\n"
-                       f"Entry: {sig['entry']}\n"
-                       f"SL: {sig['sl']}\n"
-                       f"TP: {sig['tp']}\n"
-                       f"{sig['strategy']}")
-                await send_telegram(msg)
+        # Check current UTC hour for Big Mo time window (08:00 to 12:00)
+        current_hour = datetime.now(timezone.utc).hour
+        is_big_mo_time = 8 <= current_hour < 12
 
-                if get_daily_stats()[0] >= MAX_TRADES_PER_DAY: break
+        print(f"Scanning... (Trades: {trades_today}/4 | R: {daily_R} | Big Mo Active: {is_big_mo_time})")
+        
+        # 1. Run Big Mo (if time window allows)
+        if is_big_mo_time:
+            for symbol, api_ticker in big_mo_tickers.items():
+                sig = await check_big_mo(symbol, api_ticker)
+                if sig:
+                    save_signal(sig)
+                    await publish("signal", sig)
+                    emoji = "🟢" if sig['dir'] == 'long' else "🔴"
+                    msg = (f"{emoji} <b>NEW SIGNAL: {sig['symbol']}</b>\n"
+                           f"Direction: {sig['dir'].upper()}\n"
+                           f"Entry: {sig['entry']}\n"
+                           f"SL: {sig['sl']}\n"
+                           f"TP: {sig['tp']}\n"
+                           f"{sig['strategy']}")
+                    await send_telegram(msg)
+                    if get_daily_stats()[0] >= MAX_TRADES_PER_DAY: break
+        
+        # 2. Run Main System (if trade limit not reached)
+        if get_daily_stats()[0] < MAX_TRADES_PER_DAY:
+            for symbol, api_ticker in tickers.items():
+                sig = await check_market(symbol, api_ticker)
+                if sig:
+                    save_signal(sig)
+                    await publish("signal", sig)
+                    emoji = "🟢" if sig['dir'] == 'long' else "🔴"
+                    msg = (f"{emoji} <b>NEW SIGNAL: {sig['symbol']}</b>\n"
+                           f"Direction: {sig['dir'].upper()}\n"
+                           f"Entry: {sig['entry']}\n"
+                           f"SL: {sig['sl']}\n"
+                           f"TP: {sig['tp']}\n"
+                           f"{sig['strategy']}")
+                    await send_telegram(msg)
+                    if get_daily_stats()[0] >= MAX_TRADES_PER_DAY: break
         
         await asyncio.sleep(60)
 
@@ -451,7 +506,7 @@ def index(request: Request):
         .bg-loss { background: #da3633; color: white; }
     </style></head>
     <body>
-        <h2>v2.1 Live Signals (News & Harmonics)</h2>
+        <h2>v2.1 Live Signals (Big Mo Active)</h2>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');
