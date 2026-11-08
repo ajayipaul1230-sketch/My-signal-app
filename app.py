@@ -3,7 +3,7 @@ import json
 import sqlite3
 import uuid
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 import httpx
 from fastapi import FastAPI, Request, Form
@@ -16,10 +16,11 @@ app.add_middleware(SessionMiddleware, secret_key="super-secret-random-key-123")
 APP_PASSWORD = "secret123" 
 subscribers = set()
 
-# --- API & TELEGRAM SETTINGS ---
+# --- API SETTINGS ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 
 MAX_TRADES_PER_DAY = 4
 MAX_DAILY_LOSS_R = -2.0 
@@ -27,12 +28,13 @@ MIN_SCORE = 7
 SWING_STRENGTH_H1 = 3
 SWING_STRENGTH_H4 = 5
 MIN_SWING_ATR_MULT = 0.6
+FIB_TOLERANCE = 0.02
 
-# --- DB FUNCTIONS (Unchanged) ---
+# --- DB FUNCTIONS ---
 def init_db():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
-    c.execute('''CREATE TABLE signals (
+    c.execute('''CREATE TABLE IF NOT EXISTS signals (
             id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, strategy TEXT, 
             dir TEXT, score INTEGER, entry REAL, sl REAL, tp REAL,
             status TEXT DEFAULT 'OPEN')''')
@@ -96,67 +98,96 @@ async def send_telegram(message):
         except Exception as e:
             print(f"Telegram error: {e}")
 
-# --- REAL-TIME DATA FETCHER (TwelveData) ---
-async def fetch_candles(symbol, interval, outputsize=30):
-    """Fetches real-time candles from TwelveData"""
-    if not TWELVEDATA_API_KEY:
-        print("ERROR: TWELVEDATA_API_KEY is missing!")
-        return pd.DataFrame()
-        
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVEDATA_API_KEY,
-        "format": "JSON"
-    }
+# --- ECONOMIC NEWS FILTER (§13) ---
+async def check_news_blackout():
+    """Checks if we are within 30 mins before or 45 mins after high-impact USD news"""
+    if not FINNHUB_API_KEY: return False
     
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    url = f"https://finnhub.io/api/v1/calendar/economic?from={today}&to={today}&token={FINNHUB_API_KEY}"
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.get(url)
+            data = r.json()
+            if "economicCalendar" not in data: return False
+            
+            for event in data["economicCalendar"]:
+                # Only care about USD and High Impact
+                if event.get("country") == "US" and event.get("impact") == "high":
+                    event_time = datetime.fromisoformat(event["time"]).replace(tzinfo=timezone.utc)
+                    diff = (event_time - now).total_seconds() / 60.0
+                    
+                    # 30 mins before (diff >= -30) and 45 mins after (diff <= 45)
+                    if -45 <= diff <= 30:
+                        print(f"NEWS BLACKOUT: {event['event']} in {diff} mins.")
+                        return True
+        except Exception as e:
+            print(f"News API error: {e}")
+    return False
+
+# --- REAL-TIME DATA FETCHER ---
+async def fetch_candles(symbol, interval, outputsize=50):
+    if not TWELVEDATA_API_KEY: return pd.DataFrame()
+    url = "https://api.twelvedata.com/time_series"
+    params = {"symbol": symbol, "interval": interval, "outputsize": outputsize, "apikey": TWELVEDATA_API_KEY, "format": "JSON"}
     async with httpx.AsyncClient() as client:
         try:
             r = await client.get(url, params=params)
             data = r.json()
-            
-            if "values" not in data:
-                print(f"TwelveData Error for {symbol}: {data}")
-                return pd.DataFrame()
-            
-            # Convert JSON to Pandas DataFrame
+            if "values" not in data: return pd.DataFrame()
             df = pd.DataFrame(data["values"])
             df['datetime'] = pd.to_datetime(df['datetime'])
             df.set_index('datetime', inplace=True)
-            # TwelveData returns newest first. Reverse to oldest first.
             df = df.iloc[::-1]
-            
-            # Convert strings to floats
             for col in ['open', 'high', 'low', 'close']:
                 df[col] = df[col].astype(float)
-                
             df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
             return df
-        except Exception as e:
-            print(f"Fetch Error: {e}")
+        except:
             return pd.DataFrame()
 
-# --- V2.1 MATH (Unchanged) ---
-def find_swings(df, strength, atr_val):
+# --- V2.1 TRUE HARMONIC MATH ---
+def get_alternating_swings(df, strength, atr_val):
+    """Finds the last 5 alternating swing points (X, A, B, C, D)"""
     highs = df['High'].values
     lows = df['Low'].values
-    swing_highs, swing_lows = [], []
+    raw_swings = []
+    
     for i in range(strength, len(df) - strength):
         if highs[i] == max(highs[i-strength:i+strength+1]):
             if (highs[i] - min(lows[i-strength:i+strength+1])) >= (MIN_SWING_ATR_MULT * atr_val):
-                swing_highs.append(highs[i])
+                raw_swings.append({"type": "H", "price": highs[i], "idx": i})
         if lows[i] == min(lows[i-strength:i+strength+1]):
             if (max(highs[i-strength:i+strength+1]) - lows[i]) >= (MIN_SWING_ATR_MULT * atr_val):
-                swing_lows.append(lows[i])
-    return swing_highs, swing_lows
+                raw_swings.append({"type": "L", "price": lows[i], "idx": i})
+                
+    # Clean up: ensure alternates (H, L, H, L)
+    clean_swings = []
+    for s in raw_swings:
+        if not clean_swings:
+            clean_swings.append(s)
+        else:
+            last = clean_swings[-1]
+            if s["type"] == last["type"]:
+                # If same type, keep the more extreme one
+                if (s["type"] == "H" and s["price"] > last["price"]) or (s["type"] == "L" and s["price"] < last["price"]):
+                    clean_swings[-1] = s
+            else:
+                clean_swings.append(s)
+                
+    return clean_swings[-5:] if len(clean_swings) >= 5 else []
 
 def check_htf_bias(df_h4, current_price, atr_h4):
-    h4_highs, h4_lows = find_swings(df_h4, SWING_STRENGTH_H4, atr_h4)
-    if not h4_highs or not h4_lows: return "neutral"
-    long_allowed = current_price > h4_lows[-1]
-    short_allowed = current_price < h4_highs[-1]
+    swings = get_alternating_swings(df_h4, SWING_STRENGTH_H4, atr_h4)
+    if not swings: return "neutral"
+    highs = [s["price"] for s in swings if s["type"] == "H"]
+    lows = [s["price"] for s in swings if s["type"] == "L"]
+    if not highs or not lows: return "neutral"
+    
+    long_allowed = current_price > lows[-1]
+    short_allowed = current_price < highs[-1]
     if long_allowed and not short_allowed: return "long_only"
     elif short_allowed and not long_allowed: return "short_only"
     else: return "both"
@@ -172,27 +203,43 @@ def check_c1c2_rejection(df):
     if c1_short_valid and (c2['Close'] < c1['Low']): return "short"
     return None
 
-def detect_abcd(df, direction, atr):
-    if len(df) < 10: return False
-    highs, lows = find_swings(df, 3, atr)
-    if len(highs) < 2 or len(lows) < 2: return False
-    if direction == "long":
-        recent_lows = lows[-2:]
-        if len(recent_lows) == 2:
-            ab_leg = abs(highs[-1] - recent_lows[0])
-            cd_leg = abs(highs[-1] - recent_lows[-1])
-            if ab_leg > 0 and 0.9 <= (cd_leg / ab_leg) <= 1.1: return True
-    else:
-        recent_highs = highs[-2:]
-        if len(recent_highs) == 2:
-            ab_leg = abs(recent_highs[0] - lows[-1])
-            cd_leg = abs(recent_highs[-1] - lows[-1])
-            if ab_leg > 0 and 0.9 <= (cd_leg / ab_leg) <= 1.1: return True
-    return False
+def detect_harmonic(df, direction, atr):
+    """Detects True Bat (88.6%) and Gartley (78.6%) patterns"""
+    swings = get_alternating_swings(df, 3, atr)
+    if len(swings) < 5: return None
+    
+    X, A, B, C, D = swings
+    
+    # Must end at D (the current price action)
+    if direction == "long" and D["type"] != "L": return None
+    if direction == "short" and D["type"] != "H": return None
+    
+    XA = abs(A["price"] - X["price"])
+    AB = abs(B["price"] - A["price"])
+    BC = abs(C["price"] - B["price"])
+    AD = abs(D["price"] - X["price"])
+    
+    if XA == 0: return None
+    
+    # Ratios
+    ab_xa = AB / XA
+    ad_xa = AD / XA
+    
+    # Bat Pattern (§9.3): AB 38.2-50%, D = 88.6%
+    if 0.35 <= ab_xa <= 0.55 and abs(ad_xa - 0.886) <= FIB_TOLERANCE:
+        return "Bat"
+        
+    # Gartley Pattern (§9.4): AB 61.8-78.6%, D = 78.6%
+    if 0.60 <= ab_xa <= 0.80 and abs(ad_xa - 0.786) <= FIB_TOLERANCE:
+        return "Gartley"
+        
+    return None
 
 def calculate_score(df_h1, direction, bias, atr):
     score = 0
     reasons = []
+    
+    # 1. RSI (1 Point)
     delta = df_h1['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -200,12 +247,25 @@ def calculate_score(df_h1, direction, bias, atr):
     current_rsi = float((100 - (100 / (1 + rs))).iloc[-1])
     if (direction == "long" and current_rsi < 20) or (direction == "short" and current_rsi > 80):
         score += 1; reasons.append("RSI")
+        
+    # 2. Structure (2 Points)
     if (direction == "long" and bias in ["long_only", "both"]) or \
        (direction == "short" and bias in ["short_only", "both"]):
         score += 2; reasons.append("Struct")
-    score += 2; reasons.append("Ratio")
-    if detect_abcd(df_h1, direction, atr):
-        score += 2; reasons.append("AB=CD")
+        
+    # 3. Harmonic Pattern (3 Points) - Advanced Pattern
+    harmonic = detect_harmonic(df_h1, direction, atr)
+    if harmonic:
+        score += 3; reasons.append(harmonic)
+    else:
+        # If no harmonic, check basic AB=CD (2 Points)
+        swings = get_alternating_swings(df_h1, 3, atr)
+        if len(swings) == 5:
+            ab_leg = abs(swings[1]["price"] - swings[0]["price"])
+            cd_leg = abs(swings[3]["price"] - swings[2]["price"])
+            if ab_leg > 0 and 0.9 <= (cd_leg / ab_leg) <= 1.1:
+                score += 2; reasons.append("AB=CD")
+                
     return score, "+".join(reasons)
 
 async def check_open_trades(tickers):
@@ -215,11 +275,8 @@ async def check_open_trades(tickers):
         try:
             ticker = tickers.get(trade["symbol"])
             if not ticker: continue
-            
-            # Fetch 1-minute real-time data for open trades
             df = await fetch_candles(ticker, "1min", outputsize=5)
             if df.empty: continue
-            
             current_price = float(df['Close'].iloc[-1])
             
             hit_status = None
@@ -231,22 +288,18 @@ async def check_open_trades(tickers):
                 elif current_price >= trade["sl"]: hit_status = "LOSS"
 
             if hit_status:
-                print(f"!!! TRADE CLOSED: {trade['symbol']} hit {hit_status} !!!")
                 update_trade_status(trade["id"], hit_status)
                 await publish("trade_update", {"id": trade["id"], "status": hit_status})
                 await send_telegram(f"🏁 <b>TRADE CLOSED: {trade['symbol']}</b>\nResult: {hit_status}")
-        except Exception as e:
+        except Exception:
             pass 
 
 async def check_market(symbol, api_ticker):
     try:
-        # Fetch H1 data
         df_h1 = await fetch_candles(api_ticker, "1h", outputsize=50)
         if df_h1.empty: return None
         
-        # Resample H1 to H4
         df_h4 = df_h1.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
-
         df_h1['TR'] = df_h1['High'] - df_h1['Low']
         df_h1['ATR'] = df_h1['TR'].rolling(window=14).mean()
         current_atr = float(df_h1['ATR'].iloc[-1])
@@ -291,38 +344,33 @@ async def check_market(symbol, api_ticker):
             "sl": sl,
             "tp": tp
         }
-    except Exception as e:
-        print(f"Check market error {symbol}: {e}")
+    except Exception:
         return None
 
 async def worker():
-    # TwelveData uses specific ticker formats
-    tickers = {
-        "EURUSD": "EUR/USD", 
-        "XAUUSD": "XAU/USD", 
-        "GBPUSD": "GBP/USD"
-    }
+    tickers = {"EURUSD": "EUR/USD", "XAUUSD": "XAU/USD", "GBPUSD": "GBP/USD"}
     
-    print("Checking Telegram configuration...")
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram("🤖 <b>Trading Bot Online!</b>\nSwitched to Real-Time TwelveData API.")
+        await send_telegram("🤖 <b>Trading Bot Online!</b>\nNews Filter and True Harmonics are ACTIVE.")
 
     while True:
-        # 1. Update Open Trades
         await check_open_trades(tickers)
-        
-        # 2. Check Risk limits
         trades_today, daily_R = get_daily_stats()
+        
         if daily_R <= MAX_DAILY_LOSS_R or trades_today >= MAX_TRADES_PER_DAY:
-            await asyncio.sleep(300) # Sleep 5 mins if limit hit
+            await asyncio.sleep(300)
             continue
 
-        # 3. Scan for new setups
+        # Check for News Blackout (§13)
+        is_blackout = await check_news_blackout()
+        if is_blackout:
+            await asyncio.sleep(300)
+            continue
+
         print(f"Scanning real-time markets... (Trades: {trades_today}/4 | R: {daily_R})")
         for symbol, api_ticker in tickers.items():
             sig = await check_market(symbol, api_ticker)
             if sig:
-                print(f"!!! NEW SIGNAL: {symbol} {sig['dir'].upper()} !!!")
                 save_signal(sig)
                 await publish("signal", sig)
                 
@@ -337,7 +385,6 @@ async def worker():
 
                 if get_daily_stats()[0] >= MAX_TRADES_PER_DAY: break
         
-        # Wait 60 seconds before next scan
         await asyncio.sleep(60)
 
 @app.on_event("startup")
@@ -404,7 +451,7 @@ def index(request: Request):
         .bg-loss { background: #da3633; color: white; }
     </style></head>
     <body>
-        <h2>v2.1 Live Signals (Real-Time API)</h2>
+        <h2>v2.1 Live Signals (News & Harmonics)</h2>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');

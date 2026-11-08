@@ -2,6 +2,6 @@ fastapi
 uvicorn
 itsdangerous
 python-multipart
-yfinance
 pandas
 httpx
+python-dateutil
