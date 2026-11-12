@@ -22,11 +22,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 
-# --- RISK & PORTFOLIO SETTINGS ---
-ACCOUNT_BALANCE = 10000.0   # Set this to your prop firm account size
-RISK_PER_TRADE = 0.0025     # 0.25% (The exact v2.1 Forward-Test hard cap)
-MAX_OPEN_TRADES = 2         # Prevents correlation wipeout
-
+ACCOUNT_BALANCE = 10000.0   
+RISK_PER_TRADE = 0.0025     
+MAX_OPEN_TRADES = 2         
 MAX_TRADES_PER_DAY = 4
 MAX_DAILY_LOSS_R = -2.0 
 MIN_SCORE = 7
@@ -128,11 +126,13 @@ async def check_news_blackout():
         except: pass
     return False
 
-# --- REAL-TIME DATA FETCHER ---
-async def fetch_candles(symbol, interval, outputsize=50):
+# --- OPTIMIZED DATA FETCHER ---
+async def fetch_h1_data(symbol):
+    """Fetches H1 data ONCE. Saves API limits."""
     if not TWELVEDATA_API_KEY: return pd.DataFrame()
     url = "https://api.twelvedata.com/time_series"
-    params = {"symbol": symbol, "interval": interval, "outputsize": outputsize, "apikey": TWELVEDATA_API_KEY, "format": "JSON"}
+    # Fetch 100 hours of data so we have enough to resample into H4 (25 candles)
+    params = {"symbol": symbol, "interval": "1h", "outputsize": 100, "apikey": TWELVEDATA_API_KEY, "format": "JSON"}
     async with httpx.AsyncClient() as client:
         try:
             r = await client.get(url, params=params)
@@ -141,7 +141,7 @@ async def fetch_candles(symbol, interval, outputsize=50):
             df = pd.DataFrame(data["values"])
             df['datetime'] = pd.to_datetime(df['datetime'])
             df.set_index('datetime', inplace=True)
-            df = df.iloc[::-1]
+            df = df.iloc[::-1] # Chronological order
             for col in ['open', 'high', 'low', 'close']:
                 df[col] = df[col].astype(float)
             df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
@@ -234,46 +234,6 @@ def calculate_score(df_h1, direction, bias, atr):
                 score += 2; reasons.append("AB=CD")
     return score, "+".join(reasons)
 
-async def check_big_mo(symbol, api_ticker):
-    try:
-        df_h2 = await fetch_candles(api_ticker, "2h", outputsize=50)
-        if df_h2.empty or len(df_h2) < 20: return None
-        df_h2['EMA89'] = df_h2['Close'].ewm(span=89, adjust=False).mean()
-        df_h2['EMA200'] = df_h2['Close'].ewm(span=200, adjust=False).mean()
-        df_h2['TR'] = df_h2['High'] - df_h2['Low']
-        df_h2['ATR7'] = df_h2['TR'].rolling(window=7).mean()
-        df_h2['ATR120'] = df_h2['TR'].rolling(window=120).mean()
-        if pd.isna(df_h2['ATR120'].iloc[-1]): df_h2['ATR120'] = df_h2['ATR7']
-
-        c1, c2 = df_h2.iloc[-2], df_h2.iloc[-1]
-        current_atr7 = float(df_h2['ATR7'].iloc[-1])
-        current_atr120 = float(df_h2['ATR120'].iloc[-1])
-        current_price = float(c2['Close'])
-        big_mo = float(c2['EMA89'])
-        master_mo = float(c2['EMA200'])
-        min_dist = 0.30 * current_atr7
-
-        direction = None
-        if c2['Close'] > big_mo and c2['Close'] > master_mo:
-            if (c2['Close'] - max(big_mo, master_mo)) >= min_dist: direction = "long"
-        elif c2['Close'] < big_mo and c2['Close'] < master_mo:
-            if (min(big_mo, master_mo) - c2['Close']) >= min_dist: direction = "short"
-
-        if not direction: return None
-        if direction == "long":
-            sl = round(current_price - current_atr120, 4)
-            tp = round(current_price + (2.0 * current_atr120), 4)
-        else:
-            sl = round(current_price + current_atr120, 4)
-            tp = round(current_price - (2.0 * current_atr120), 4)
-
-        return {
-            "id": str(uuid.uuid4())[:6], "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol": symbol, "strategy": "EMA89_PB_v0.1 - Experimental", "dir": direction,
-            "score": 10, "entry": round(current_price, 4), "sl": sl, "tp": tp
-        }
-    except: return None
-
 async def check_open_trades(tickers):
     open_trades = get_open_trades()
     if not open_trades: return
@@ -281,7 +241,9 @@ async def check_open_trades(tickers):
         try:
             ticker = tickers.get(trade["symbol"])
             if not ticker: continue
-            df = await fetch_candles(ticker, "1min", outputsize=5)
+            
+            # Use H1 data for open trade updates to save API calls
+            df = await fetch_h1_data(ticker) 
             if df.empty: continue
             current_price = float(df['Close'].iloc[-1])
             
@@ -301,29 +263,41 @@ async def check_open_trades(tickers):
 
 async def check_market(symbol, api_ticker):
     try:
-        df_h1 = await fetch_candles(api_ticker, "1h", outputsize=50)
-        if df_h1.empty: return None
+        # 1. Fetch H1 Data ONCE
+        df_h1 = await fetch_h1_data(api_ticker)
+        if df_h1.empty or len(df_h1) < 50: return None
+        
+        # 2. Resample locally to H4 and H2
         df_h4 = df_h1.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
+        
+        # 3. Calculate ATRs
         df_h1['TR'] = df_h1['High'] - df_h1['Low']
         df_h1['ATR'] = df_h1['TR'].rolling(window=14).mean()
         current_atr = float(df_h1['ATR'].iloc[-1])
         current_price = float(df_h1['Close'].iloc[-1])
+        
         df_h4['TR'] = df_h4['High'] - df_h4['Low']
         df_h4['ATR'] = df_h4['TR'].rolling(window=14).mean()
         atr_h4 = float(df_h4['ATR'].iloc[-1])
+
+        # 4. Check Conditions
         bias = check_htf_bias(df_h4, current_price, atr_h4)
         rejection_dir = check_c1c2_rejection(df_h1)
         if not rejection_dir: return None
         if rejection_dir == "long" and bias not in ["long_only", "both"]: return None
         if rejection_dir == "short" and bias not in ["short_only", "both"]: return None
+
         score, reason_string = calculate_score(df_h1, rejection_dir, bias, current_atr)
         if score < MIN_SCORE: return None
+
+        # 5. Calculate SL/TP
         if rejection_dir == "long":
             sl = round(current_price - (1.5 * current_atr), 4)
             tp = round(current_price + (2.0 * current_atr), 4)
         else:
             sl = round(current_price + (1.5 * current_atr), 4)
             tp = round(current_price - (2.0 * current_atr), 4)
+
         risk = abs(current_price - sl)
         reward = abs(tp - current_price)
         rr = reward / risk if risk > 0 else 0
@@ -331,6 +305,7 @@ async def check_market(symbol, api_ticker):
         if symbol in ["XAUUSD", "BTCUSD"]: min_rr = 1.70
         elif symbol == "USDCAD": min_rr = 1.50
         if rr < min_rr: return None
+
         return {
             "id": str(uuid.uuid4())[:6], "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol, "strategy": f"Score {score}/12 ({reason_string})", "dir": rejection_dir,
@@ -339,28 +314,23 @@ async def check_market(symbol, api_ticker):
     except: return None
 
 async def worker():
-    # EXPANDED WATCHLIST FOR FASTER SAMPLE SIZE
     tickers = {
-        "EURUSD": "EUR/USD", 
-        "GBPUSD": "GBP/USD", 
-        "XAUUSD": "XAU/USD",
-        "AUDUSD": "AUD/USD",
-        "USDJPY": "USD/JPY"
+        "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "XAUUSD": "XAU/USD",
+        "AUDUSD": "AUD/USD", "USDJPY": "USD/JPY"
     }
-    big_mo_tickers = {"EURUSD": "EUR/USD", "GBPUSD": "GBP/USD"}
-
+    
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram("🤖 <b>Bot Online! (Portfolio Mode)</b>\nExpanded to 5 pairs. Risk is locked at 0.25%.")
+        await send_telegram("🤖 <b>Bot Online! (Optimized)</b>\nScanning 5 pairs. API limits secured.")
+
+    last_heartbeat = None
 
     while True:
         await check_open_trades(tickers)
         trades_today, daily_R = get_daily_stats()
         
-        # --- CORRELATION & RISK LIMITS ---
         open_trades = get_open_trades()
         if len(open_trades) >= MAX_OPEN_TRADES:
-            print(f"Max concurrent trades reached ({len(open_trades)}/{MAX_OPEN_TRADES}). Waiting...")
-            await asyncio.sleep(300)
+            await asyncio.sleep(300) # Sleep 5 mins
             continue
 
         if daily_R <= MAX_DAILY_LOSS_R or trades_today >= MAX_TRADES_PER_DAY:
@@ -372,52 +342,34 @@ async def worker():
             await asyncio.sleep(300)
             continue
 
-        current_hour = datetime.now(timezone.utc).hour
-        is_big_mo_time = 8 <= current_hour < 12
+        # Send a daily heartbeat at 08:00 UTC so you know it's alive
+        now = datetime.now(timezone.utc)
+        if now.hour == 8 and (last_heartbeat is None or last_heartbeat.day != now.day):
+            await send_telegram(f"💓 <b>Daily Heartbeat</b>\nBot is alive. Scanned 5 pairs. 0 open trades.\nWaiting for setups...")
+            last_heartbeat = now
 
         print(f"Scanning... (Trades: {trades_today}/4 | R: {daily_R} | Open: {len(open_trades)})")
         
-        # Run Big Mo
-        if is_big_mo_time:
-            for symbol, api_ticker in big_mo_tickers.items():
-                sig = await check_big_mo(symbol, api_ticker)
-                if sig:
-                    save_signal(sig)
-                    await publish("signal", sig)
-                    emoji = "🟢" if sig['dir'] == 'long' else "🔴"
-                    risk_usd = ACCOUNT_BALANCE * RISK_PER_TRADE
-                    msg = (f"{emoji} <b>BIG MO: {sig['symbol']}</b>\n"
-                           f"Direction: {sig['dir'].upper()}\n"
-                           f"Entry: {sig['entry']}\n"
-                           f"SL: {sig['sl']}\n"
-                           f"TP: {sig['tp']}\n"
-                           f"Risk: ${risk_usd:.2f} (0.25%)\n"
-                           f"{sig['strategy']}")
-                    await send_telegram(msg)
-                    if get_daily_stats()[0] >= MAX_TRADES_PER_DAY: break
+        for symbol, api_ticker in tickers.items():
+            sig = await check_market(symbol, api_ticker)
+            if sig:
+                save_signal(sig)
+                await publish("signal", sig)
+                emoji = "🟢" if sig['dir'] == 'long' else "🔴"
+                risk_usd = ACCOUNT_BALANCE * RISK_PER_TRADE
+                msg = (f"{emoji} <b>NEW SIGNAL: {sig['symbol']}</b>\n"
+                       f"Direction: {sig['dir'].upper()}\n"
+                       f"Entry: {sig['entry']}\n"
+                       f"SL: {sig['sl']}\n"
+                       f"TP: {sig['tp']}\n"
+                       f"Risk: ${risk_usd:.2f} (0.25%)\n"
+                       f"{sig['strategy']}")
+                await send_telegram(msg)
+                
+                if get_daily_stats()[0] >= MAX_TRADES_PER_DAY or len(get_open_trades()) >= MAX_OPEN_TRADES: 
+                    break
         
-        # Run Main System
-        if get_daily_stats()[0] < MAX_TRADES_PER_DAY and len(get_open_trades()) < MAX_OPEN_TRADES:
-            for symbol, api_ticker in tickers.items():
-                sig = await check_market(symbol, api_ticker)
-                if sig:
-                    save_signal(sig)
-                    await publish("signal", sig)
-                    emoji = "🟢" if sig['dir'] == 'long' else "🔴"
-                    risk_usd = ACCOUNT_BALANCE * RISK_PER_TRADE
-                    msg = (f"{emoji} <b>NEW SIGNAL: {sig['symbol']}</b>\n"
-                           f"Direction: {sig['dir'].upper()}\n"
-                           f"Entry: {sig['entry']}\n"
-                           f"SL: {sig['sl']}\n"
-                           f"TP: {sig['tp']}\n"
-                           f"Risk: ${risk_usd:.2f} (0.25%)\n"
-                           f"{sig['strategy']}")
-                    await send_telegram(msg)
-                    
-                    # Stop scanning this loop if we hit max open limits
-                    if get_daily_stats()[0] >= MAX_TRADES_PER_DAY or len(get_open_trades()) >= MAX_OPEN_TRADES: 
-                        break
-        
+        # Wait 60 seconds before next scan
         await asyncio.sleep(60)
 
 @app.on_event("startup")
