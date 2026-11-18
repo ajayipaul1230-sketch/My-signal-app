@@ -32,6 +32,7 @@ SWING_STRENGTH_H1 = 3
 SWING_STRENGTH_H4 = 5
 MIN_SWING_ATR_MULT = 0.6
 FIB_TOLERANCE = 0.02
+MIN_IMPULSE_ATR = 1.5  # A candle must be 1.5x ATR to be considered institutional
 
 # --- DB FUNCTIONS ---
 def init_db():
@@ -75,7 +76,7 @@ def get_daily_stats():
     daily_R = 0.0
     for count, status in rows:
         trades_today += count
-        if status == "WIN": daily_R += 1.5 
+        if status == "WIN": daily_R += 2.0 
         elif status == "LOSS": daily_R -= 1.0 
     return trades_today, daily_R
 
@@ -120,7 +121,6 @@ async def check_news_blackout():
                         event_time = datetime.fromisoformat(time_str.replace(" ", "T")).replace(tzinfo=timezone.utc)
                         diff = (event_time - now).total_seconds() / 60.0
                         if -45 <= diff <= 30:
-                            print(f"NEWS BLACKOUT: {event.get('event')} in {diff} mins.")
                             return True
                     except: continue
         except: pass
@@ -128,10 +128,8 @@ async def check_news_blackout():
 
 # --- OPTIMIZED DATA FETCHER ---
 async def fetch_h1_data(symbol):
-    """Fetches H1 data ONCE. Saves API limits."""
     if not TWELVEDATA_API_KEY: return pd.DataFrame()
     url = "https://api.twelvedata.com/time_series"
-    # Fetch 100 hours of data so we have enough to resample into H4 (25 candles)
     params = {"symbol": symbol, "interval": "1h", "outputsize": 100, "apikey": TWELVEDATA_API_KEY, "format": "JSON"}
     async with httpx.AsyncClient() as client:
         try:
@@ -141,15 +139,15 @@ async def fetch_h1_data(symbol):
             df = pd.DataFrame(data["values"])
             df['datetime'] = pd.to_datetime(df['datetime'])
             df.set_index('datetime', inplace=True)
-            df = df.iloc[::-1] # Chronological order
+            df = df.iloc[::-1] 
             for col in ['open', 'high', 'low', 'close']:
                 df[col] = df[col].astype(float)
             df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
             return df
         except: return pd.DataFrame()
 
-# --- V2.1 TRUE HARMONIC MATH ---
-def get_alternating_swings(df, strength, atr_val):
+# --- V2.1 HARMONIC MATH ---
+def get_confirmed_swings(df, strength, atr_val):
     highs = df['High'].values
     lows = df['Low'].values
     raw_swings = []
@@ -172,7 +170,7 @@ def get_alternating_swings(df, strength, atr_val):
     return clean_swings[-5:] if len(clean_swings) >= 5 else []
 
 def check_htf_bias(df_h4, current_price, atr_h4):
-    swings = get_alternating_swings(df_h4, SWING_STRENGTH_H4, atr_h4)
+    swings = get_confirmed_swings(df_h4, SWING_STRENGTH_H4, atr_h4)
     if not swings: return "neutral"
     highs = [s["price"] for s in swings if s["type"] == "H"]
     lows = [s["price"] for s in swings if s["type"] == "L"]
@@ -194,22 +192,22 @@ def check_c1c2_rejection(df):
     if c1_short_valid and (c2['Close'] < c1['Low']): return "short"
     return None
 
-def detect_harmonic(df, direction, atr):
-    swings = get_alternating_swings(df, 3, atr)
-    if len(swings) < 5: return None
-    X, A, B, C, D = swings
-    if direction == "long" and D["type"] != "L": return None
-    if direction == "short" and D["type"] != "H": return None
+def detect_harmonic(df, direction, atr, current_price):
+    swings = get_confirmed_swings(df, 3, atr)
+    if len(swings) < 4: return None
+    X, A, B, C = swings
+    if direction == "long" and C["type"] != "H": return None
+    if direction == "short" and C["type"] != "L": return None
     XA = abs(A["price"] - X["price"])
     AB = abs(B["price"] - A["price"])
-    AD = abs(D["price"] - X["price"])
+    AD = abs(current_price - X["price"])
     if XA == 0: return None
     ab_xa, ad_xa = AB / XA, AD / XA
     if 0.35 <= ab_xa <= 0.55 and abs(ad_xa - 0.886) <= FIB_TOLERANCE: return "Bat"
     if 0.60 <= ab_xa <= 0.80 and abs(ad_xa - 0.786) <= FIB_TOLERANCE: return "Gartley"
     return None
 
-def calculate_score(df_h1, direction, bias, atr):
+def calculate_score(df_h1, direction, bias, atr, current_price):
     score = 0
     reasons = []
     delta = df_h1['Close'].diff()
@@ -222,17 +220,49 @@ def calculate_score(df_h1, direction, bias, atr):
     if (direction == "long" and bias in ["long_only", "both"]) or \
        (direction == "short" and bias in ["short_only", "both"]):
         score += 2; reasons.append("Struct")
-    harmonic = detect_harmonic(df_h1, direction, atr)
+    harmonic = detect_harmonic(df_h1, direction, atr, current_price)
     if harmonic:
         score += 3; reasons.append(harmonic)
     else:
-        swings = get_alternating_swings(df_h1, 3, atr)
-        if len(swings) == 5:
+        swings = get_confirmed_swings(df_h1, 3, atr)
+        if len(swings) == 4:
             ab_leg = abs(swings[1]["price"] - swings[0]["price"])
             cd_leg = abs(swings[3]["price"] - swings[2]["price"])
             if ab_leg > 0 and 0.9 <= (cd_leg / ab_leg) <= 1.1:
                 score += 2; reasons.append("AB=CD")
     return score, "+".join(reasons)
+
+# --- NEW: INSTITUTIONAL SUPPLY & DEMAND ENGINE ---
+def check_supply_demand(df_h1, direction, current_price, current_atr):
+    """Scans for institutional imbalances (Impulse + Base)"""
+    if len(df_h1) < 40: return None
+    
+    # Look back up to 30 candles to find a fresh zone
+    for i in range(len(df_h1) - 5, len(df_h1) - 30, -1):
+        c_impulse = df_h1.iloc[i]   # The explosive candle
+        c_base = df_h1.iloc[i-1]    # The candle before it (The Zone)
+        
+        impulse_body = abs(c_impulse['Close'] - c_impulse['Open'])
+        
+        # 1. Identify the Imbalance (Impulse must be >= 1.5x ATR)
+        if impulse_body >= (MIN_IMPULSE_ATR * current_atr):
+            zone_top = c_base['High']
+            zone_bottom = c_base['Low']
+            
+            # 2. Identify Demand (Bullish Impulse)
+            if direction == "long" and c_impulse['Close'] > c_impulse['Open']:
+                # Is current price pulling back into this Demand Zone?
+                if zone_bottom <= current_price <= zone_top:
+                    # We are in the zone! Check for C1/C2 confirmation
+                    return {"zone_type": "Demand", "top": round(zone_top, 4), "bottom": round(zone_bottom, 4)}
+                    
+            # 3. Identify Supply (Bearish Impulse)
+            if direction == "short" and c_impulse['Close'] < c_impulse['Open']:
+                # Is current price pulling back into this Supply Zone?
+                if zone_bottom <= current_price <= zone_top:
+                    return {"zone_type": "Supply", "top": round(zone_top, 4), "bottom": round(zone_bottom, 4)}
+                    
+    return None
 
 async def check_open_trades(tickers):
     open_trades = get_open_trades()
@@ -241,8 +271,6 @@ async def check_open_trades(tickers):
         try:
             ticker = tickers.get(trade["symbol"])
             if not ticker: continue
-            
-            # Use H1 data for open trade updates to save API calls
             df = await fetch_h1_data(ticker) 
             if df.empty: continue
             current_price = float(df['Close'].iloc[-1])
@@ -263,14 +291,11 @@ async def check_open_trades(tickers):
 
 async def check_market(symbol, api_ticker):
     try:
-        # 1. Fetch H1 Data ONCE
         df_h1 = await fetch_h1_data(api_ticker)
         if df_h1.empty or len(df_h1) < 50: return None
         
-        # 2. Resample locally to H4 and H2
         df_h4 = df_h1.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
         
-        # 3. Calculate ATRs
         df_h1['TR'] = df_h1['High'] - df_h1['Low']
         df_h1['ATR'] = df_h1['TR'].rolling(window=14).mean()
         current_atr = float(df_h1['ATR'].iloc[-1])
@@ -280,17 +305,35 @@ async def check_market(symbol, api_ticker):
         df_h4['ATR'] = df_h4['TR'].rolling(window=14).mean()
         atr_h4 = float(df_h4['ATR'].iloc[-1])
 
-        # 4. Check Conditions
         bias = check_htf_bias(df_h4, current_price, atr_h4)
         rejection_dir = check_c1c2_rejection(df_h1)
+        
         if not rejection_dir: return None
         if rejection_dir == "long" and bias not in ["long_only", "both"]: return None
         if rejection_dir == "short" and bias not in ["short_only", "both"]: return None
 
-        score, reason_string = calculate_score(df_h1, rejection_dir, bias, current_atr)
-        if score < MIN_SCORE: return None
+        # --- CHECK INSTITUTIONAL SUPPLY & DEMAND ---
+        sd_zone = check_supply_demand(df_h1, rejection_dir, current_price, current_atr)
+        if sd_zone:
+            # We are inside an institutional zone with a C1/C2 rejection!
+            if rejection_dir == "long":
+                sl = round(sd_zone["bottom"] - (0.2 * current_atr), 4) # SL just below Demand
+                tp = round(current_price + (2.5 * current_atr), 4)     # High RR
+            else:
+                sl = round(sd_zone["top"] + (0.2 * current_atr), 4)    # SL just above Supply
+                tp = round(current_price - (2.5 * current_atr), 4)
+                
+            return {
+                "id": str(uuid.uuid4())[:6], "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol": symbol, "strategy": f"S&D {sd_zone['zone_type']} Zone", "dir": rejection_dir,
+                "score": 9, "entry": round(current_price, 4), "sl": sl, "tp": tp
+            }
 
-        # 5. Calculate SL/TP
+        # --- IF NO S&D, CHECK V2.1 HARMONICS ---
+        score, reason_string = calculate_score(df_h1, rejection_dir, bias, current_atr, current_price)
+        if score < MIN_SCORE: 
+            return None
+
         if rejection_dir == "long":
             sl = round(current_price - (1.5 * current_atr), 4)
             tp = round(current_price + (2.0 * current_atr), 4)
@@ -298,20 +341,14 @@ async def check_market(symbol, api_ticker):
             sl = round(current_price + (1.5 * current_atr), 4)
             tp = round(current_price - (2.0 * current_atr), 4)
 
-        risk = abs(current_price - sl)
-        reward = abs(tp - current_price)
-        rr = reward / risk if risk > 0 else 0
-        min_rr = 1.40
-        if symbol in ["XAUUSD", "BTCUSD"]: min_rr = 1.70
-        elif symbol == "USDCAD": min_rr = 1.50
-        if rr < min_rr: return None
-
         return {
             "id": str(uuid.uuid4())[:6], "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol": symbol, "strategy": f"Score {score}/12 ({reason_string})", "dir": rejection_dir,
+            "symbol": symbol, "strategy": f"V2.1 Score {score}/12 ({reason_string})", "dir": rejection_dir,
             "score": score, "entry": round(current_price, 4), "sl": sl, "tp": tp
         }
-    except: return None
+    except Exception as e: 
+        print(f"Error checking {symbol}: {e}")
+        return None
 
 async def worker():
     tickers = {
@@ -320,20 +357,14 @@ async def worker():
     }
     
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram("🤖 <b>Bot Online! (Optimized)</b>\nScanning 5 pairs. API limits secured.")
-
-    last_heartbeat = None
+        await send_telegram("🤖 <b>Bot Online!</b>\nDual-Mode Active: Institutional Supply/Demand + v2.1 Harmonics.")
 
     while True:
         await check_open_trades(tickers)
         trades_today, daily_R = get_daily_stats()
         
         open_trades = get_open_trades()
-        if len(open_trades) >= MAX_OPEN_TRADES:
-            await asyncio.sleep(300) # Sleep 5 mins
-            continue
-
-        if daily_R <= MAX_DAILY_LOSS_R or trades_today >= MAX_TRADES_PER_DAY:
+        if len(open_trades) >= MAX_OPEN_TRADES or daily_R <= MAX_DAILY_LOSS_R or trades_today >= MAX_TRADES_PER_DAY:
             await asyncio.sleep(300)
             continue
 
@@ -341,12 +372,6 @@ async def worker():
         if is_blackout:
             await asyncio.sleep(300)
             continue
-
-        # Send a daily heartbeat at 08:00 UTC so you know it's alive
-        now = datetime.now(timezone.utc)
-        if now.hour == 8 and (last_heartbeat is None or last_heartbeat.day != now.day):
-            await send_telegram(f"💓 <b>Daily Heartbeat</b>\nBot is alive. Scanned 5 pairs. 0 open trades.\nWaiting for setups...")
-            last_heartbeat = now
 
         print(f"Scanning... (Trades: {trades_today}/4 | R: {daily_R} | Open: {len(open_trades)})")
         
@@ -358,18 +383,17 @@ async def worker():
                 emoji = "🟢" if sig['dir'] == 'long' else "🔴"
                 risk_usd = ACCOUNT_BALANCE * RISK_PER_TRADE
                 msg = (f"{emoji} <b>NEW SIGNAL: {sig['symbol']}</b>\n"
+                       f"Strategy: {sig['strategy']}\n"
                        f"Direction: {sig['dir'].upper()}\n"
                        f"Entry: {sig['entry']}\n"
                        f"SL: {sig['sl']}\n"
                        f"TP: {sig['tp']}\n"
-                       f"Risk: ${risk_usd:.2f} (0.25%)\n"
-                       f"{sig['strategy']}")
+                       f"Risk: ${risk_usd:.2f} (0.25%)")
                 await send_telegram(msg)
                 
                 if get_daily_stats()[0] >= MAX_TRADES_PER_DAY or len(get_open_trades()) >= MAX_OPEN_TRADES: 
                     break
         
-        # Wait 60 seconds before next scan
         await asyncio.sleep(60)
 
 @app.on_event("startup")
@@ -424,7 +448,7 @@ def index(request: Request):
     if not request.session.get("logged_in"): return RedirectResponse(url="/login")
     return HTMLResponse("""
     <html>
-    <head><title>v2.1 Signals</title>
+    <head><title>S&D & v2.1 Signals</title>
     <style>
         body { background: #0f1216; color: #e6edf3; font-family: monospace; padding: 20px; }
         .card { border: 1px solid #26303b; padding: 15px; margin-bottom: 10px; border-radius: 6px; background: #171c23; }
@@ -436,7 +460,7 @@ def index(request: Request):
         .bg-loss { background: #da3633; color: white; }
     </style></head>
     <body>
-        <h2>v2.1 Live Signals (Portfolio Mode)</h2>
+        <h2>Live Signals (Institutional S&D + v2.1)</h2>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');
