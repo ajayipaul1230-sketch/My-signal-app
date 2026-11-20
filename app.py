@@ -38,6 +38,7 @@ MIN_IMPULSE_ATR = 1.2  # Lowered from 1.5 to catch more institutional moves
 def init_db():
     conn = sqlite3.connect("signals.db")
     c = conn.cursor()
+    c.execute("DROP TABLE IF EXISTS signals") # <--- ADD THIS LINE
     c.execute('''CREATE TABLE IF NOT EXISTS signals (
             id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, strategy TEXT, 
             dir TEXT, score INTEGER, entry REAL, sl REAL, tp REAL,
