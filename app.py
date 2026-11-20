@@ -32,7 +32,7 @@ SWING_STRENGTH_H1 = 3
 SWING_STRENGTH_H4 = 5
 MIN_SWING_ATR_MULT = 0.6
 FIB_TOLERANCE = 0.02
-MIN_IMPULSE_ATR = 1.5  # A candle must be 1.5x ATR to be considered institutional
+MIN_IMPULSE_ATR = 1.2  # Lowered from 1.5 to catch more institutional moves
 
 # --- DB FUNCTIONS ---
 def init_db():
@@ -93,12 +93,15 @@ async def publish(event: str, data: dict):
         await q.put({"event": event, "data": data})
 
 async def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: 
+        print("Telegram config missing!")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(url, json=payload)
+            r = await client.post(url, json=payload)
+            print(f"Telegram response: {r.status_code}")
         except Exception as e:
             print(f"Telegram error: {e}")
 
@@ -135,7 +138,9 @@ async def fetch_h1_data(symbol):
         try:
             r = await client.get(url, params=params)
             data = r.json()
-            if "values" not in data: return pd.DataFrame()
+            if "values" not in data: 
+                print(f"API Error {symbol}: {data}")
+                return pd.DataFrame()
             df = pd.DataFrame(data["values"])
             df['datetime'] = pd.to_datetime(df['datetime'])
             df.set_index('datetime', inplace=True)
@@ -144,7 +149,9 @@ async def fetch_h1_data(symbol):
                 df[col] = df[col].astype(float)
             df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
             return df
-        except: return pd.DataFrame()
+        except Exception as e: 
+            print(f"Fetch Error {symbol}: {e}")
+            return pd.DataFrame()
 
 # --- V2.1 HARMONIC MATH ---
 def get_confirmed_swings(df, strength, atr_val):
@@ -186,9 +193,12 @@ def check_c1c2_rejection(df):
     c1, c2 = df.iloc[-2], df.iloc[-1]
     c1_range = c1['High'] - c1['Low']
     if c1_range == 0: return None
-    c1_long_valid = ((c1['Close'] - c1['Low']) / c1_range >= 0.75) and (c1['Close'] > c1['Open'])
+    
+    # LOOSENED TO 0.60 for higher frequency
+    c1_long_valid = ((c1['Close'] - c1['Low']) / c1_range >= 0.60) and (c1['Close'] > c1['Open'])
     if c1_long_valid and (c2['Close'] > c1['High']): return "long"
-    c1_short_valid = ((c1['High'] - c1['Close']) / c1_range >= 0.75) and (c1['Close'] < c1['Open'])
+    
+    c1_short_valid = ((c1['High'] - c1['Close']) / c1_range >= 0.60) and (c1['Close'] < c1['Open'])
     if c1_short_valid and (c2['Close'] < c1['Low']): return "short"
     return None
 
@@ -232,36 +242,30 @@ def calculate_score(df_h1, direction, bias, atr, current_price):
                 score += 2; reasons.append("AB=CD")
     return score, "+".join(reasons)
 
-# --- NEW: INSTITUTIONAL SUPPLY & DEMAND ENGINE ---
+# --- INSTITUTIONAL SUPPLY & DEMAND ---
 def check_supply_demand(df_h1, direction, current_price, current_atr):
-    """Scans for institutional imbalances (Impulse + Base)"""
     if len(df_h1) < 40: return None
-    
-    # Look back up to 30 candles to find a fresh zone
-    for i in range(len(df_h1) - 5, len(df_h1) - 30, -1):
-        c_impulse = df_h1.iloc[i]   # The explosive candle
-        c_base = df_h1.iloc[i-1]    # The candle before it (The Zone)
+    # Look back up to 50 candles (increased from 30)
+    for i in range(len(df_h1) - 5, len(df_h1) - 50, -1):
+        c_impulse = df_h1.iloc[i]
+        c_base = df_h1.iloc[i-1]
         
         impulse_body = abs(c_impulse['Close'] - c_impulse['Open'])
         
-        # 1. Identify the Imbalance (Impulse must be >= 1.5x ATR)
         if impulse_body >= (MIN_IMPULSE_ATR * current_atr):
             zone_top = c_base['High']
             zone_bottom = c_base['Low']
             
-            # 2. Identify Demand (Bullish Impulse)
+            # Add a buffer to the zone so we don't miss the entry by a fraction of a pip
+            buffer = 0.1 * current_atr
+            
             if direction == "long" and c_impulse['Close'] > c_impulse['Open']:
-                # Is current price pulling back into this Demand Zone?
-                if zone_bottom <= current_price <= zone_top:
-                    # We are in the zone! Check for C1/C2 confirmation
+                if (zone_bottom - buffer) <= current_price <= (zone_top + buffer):
                     return {"zone_type": "Demand", "top": round(zone_top, 4), "bottom": round(zone_bottom, 4)}
                     
-            # 3. Identify Supply (Bearish Impulse)
             if direction == "short" and c_impulse['Close'] < c_impulse['Open']:
-                # Is current price pulling back into this Supply Zone?
-                if zone_bottom <= current_price <= zone_top:
+                if (zone_bottom - buffer) <= current_price <= (zone_top + buffer):
                     return {"zone_type": "Supply", "top": round(zone_top, 4), "bottom": round(zone_bottom, 4)}
-                    
     return None
 
 async def check_open_trades(tickers):
@@ -292,7 +296,9 @@ async def check_open_trades(tickers):
 async def check_market(symbol, api_ticker):
     try:
         df_h1 = await fetch_h1_data(api_ticker)
-        if df_h1.empty or len(df_h1) < 50: return None
+        if df_h1.empty or len(df_h1) < 50: 
+            print(f"[{symbol}] Empty or insufficient data.")
+            return None
         
         df_h4 = df_h1.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
         
@@ -308,19 +314,25 @@ async def check_market(symbol, api_ticker):
         bias = check_htf_bias(df_h4, current_price, atr_h4)
         rejection_dir = check_c1c2_rejection(df_h1)
         
-        if not rejection_dir: return None
-        if rejection_dir == "long" and bias not in ["long_only", "both"]: return None
-        if rejection_dir == "short" and bias not in ["short_only", "both"]: return None
+        if not rejection_dir: 
+            print(f"[{symbol}] Rejected: No C1/C2 rejection candle.")
+            return None
 
-        # --- CHECK INSTITUTIONAL SUPPLY & DEMAND ---
+        if rejection_dir == "long" and bias not in ["long_only", "both"]: 
+            print(f"[{symbol}] Rejected: C1/C2 is Long, but H4 Bias is {bias}.")
+            return None
+        if rejection_dir == "short" and bias not in ["short_only", "both"]: 
+            print(f"[{symbol}] Rejected: C1/C2 is Short, but H4 Bias is {bias}.")
+            return None
+
+        # Check S&D
         sd_zone = check_supply_demand(df_h1, rejection_dir, current_price, current_atr)
         if sd_zone:
-            # We are inside an institutional zone with a C1/C2 rejection!
             if rejection_dir == "long":
-                sl = round(sd_zone["bottom"] - (0.2 * current_atr), 4) # SL just below Demand
-                tp = round(current_price + (2.5 * current_atr), 4)     # High RR
+                sl = round(sd_zone["bottom"] - (0.2 * current_atr), 4) 
+                tp = round(current_price + (2.5 * current_atr), 4)     
             else:
-                sl = round(sd_zone["top"] + (0.2 * current_atr), 4)    # SL just above Supply
+                sl = round(sd_zone["top"] + (0.2 * current_atr), 4)    
                 tp = round(current_price - (2.5 * current_atr), 4)
                 
             return {
@@ -328,10 +340,12 @@ async def check_market(symbol, api_ticker):
                 "symbol": symbol, "strategy": f"S&D {sd_zone['zone_type']} Zone", "dir": rejection_dir,
                 "score": 9, "entry": round(current_price, 4), "sl": sl, "tp": tp
             }
+        else:
+            print(f"[{symbol}] Rejected: No S&D zone found at current price.")
 
-        # --- IF NO S&D, CHECK V2.1 HARMONICS ---
         score, reason_string = calculate_score(df_h1, rejection_dir, bias, current_atr, current_price)
         if score < MIN_SCORE: 
+            print(f"[{symbol}] Rejected: V2.1 Score {score}/12 (Need 7)")
             return None
 
         if rejection_dir == "long":
@@ -357,7 +371,7 @@ async def worker():
     }
     
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram("🤖 <b>Bot Online!</b>\nDual-Mode Active: Institutional Supply/Demand + v2.1 Harmonics.")
+        await send_telegram("🤖 <b>Bot Online!</b>\nWide Open Mode Active. Verbose Logging ON. Manual trigger available.")
 
     while True:
         await check_open_trades(tickers)
@@ -370,10 +384,11 @@ async def worker():
 
         is_blackout = await check_news_blackout()
         if is_blackout:
+            print("NEWS BLACKOUT ACTIVE.")
             await asyncio.sleep(300)
             continue
 
-        print(f"Scanning... (Trades: {trades_today}/4 | R: {daily_R} | Open: {len(open_trades)})")
+        print(f"\n--- Scanning (Trades: {trades_today}/4 | R: {daily_R} | Open: {len(open_trades)}) ---")
         
         for symbol, api_ticker in tickers.items():
             sig = await check_market(symbol, api_ticker)
@@ -401,9 +416,22 @@ async def startup():
     init_db()
     asyncio.create_task(worker())
 
-# --- WEB ROUTES (Unchanged) ---
+# --- WEB ROUTES ---
 @app.get("/healthz")
 def healthz(): return {"status": "ok"}
+
+@app.get("/test-signal")
+async def test_signal():
+    """MANUAL TRIGGER: Bypasses all math and sends a test signal to Telegram"""
+    dummy_sig = {
+        "id": str(uuid.uuid4())[:6], "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": "TEST", "strategy": "MANUAL TEST", "dir": "long",
+        "score": 10, "entry": 1.0000, "sl": 0.9900, "tp": 1.0200
+    }
+    save_signal(dummy_sig)
+    await publish("signal", dummy_sig)
+    await send_telegram("🚨 <b>MANUAL TEST SIGNAL</b>\nIf you see this, the Telegram pipeline is working perfectly.")
+    return {"status": "test signal sent"}
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page():
@@ -448,7 +476,7 @@ def index(request: Request):
     if not request.session.get("logged_in"): return RedirectResponse(url="/login")
     return HTMLResponse("""
     <html>
-    <head><title>S&D & v2.1 Signals</title>
+    <head><title>Signals</title>
     <style>
         body { background: #0f1216; color: #e6edf3; font-family: monospace; padding: 20px; }
         .card { border: 1px solid #26303b; padding: 15px; margin-bottom: 10px; border-radius: 6px; background: #171c23; }
@@ -460,7 +488,10 @@ def index(request: Request):
         .bg-loss { background: #da3633; color: white; }
     </style></head>
     <body>
-        <h2>Live Signals (Institutional S&D + v2.1)</h2>
+        <h2>Live Signals</h2>
+        <button onclick="fetch('/test-signal').then(()=>alert('Test sent to Telegram!'))" style="background:#1f6feb; color:white; border:none; padding:10px; margin-bottom:20px; cursor:pointer; border-radius:4px;">
+            🚨 Trigger Manual Test Signal
+        </button>
         <div id="list">Loading history...</div>
         <script>
             const list = document.getElementById('list');
