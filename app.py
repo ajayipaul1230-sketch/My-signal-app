@@ -20,7 +20,7 @@ subscribers = set()
 # --- PASTE YOUR KEYS HERE ---
 TELEGRAM_TOKEN = "9096846772:AAEF5MKRdUeBnIrx1WwJqadHz2wfqMGTMvI"
 TELEGRAM_CHAT_ID = "7185853274"
-TWELVEDATA_API_KEY = "8cbd61450fb54efc8de484c2281ce149"
+TWELVEDATA_API_KEY = "c3f14c9210eb4359ac15fcb321192494".strip()
 FINNHUB_API_KEY = "dc5ast1r01qochf1766gdc5ast1r01qochf17670"
 # ----------------------------
 
