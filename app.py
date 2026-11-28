@@ -20,7 +20,7 @@ subscribers = set()
 # --- PASTE YOUR KEYS HERE ---
 TELEGRAM_TOKEN = "9096846772:AAEF5MKRdUeBnIrx1WwJqadHz2wfqMGTMvI"
 TELEGRAM_CHAT_ID = "7185853274"
-TWELVEDATA_API_KEY = "c3f14c9210eb4359ac15fcb321192494".strip()
+TWELVEDATA_API_KEY = "c3f14c9210eb4359ac15fcb321192494".strip()  
 FINNHUB_API_KEY = "dc5ast1r01qochf1766gdc5ast1r01qochf17670"
 # ----------------------------
 
@@ -30,7 +30,11 @@ MAX_OPEN_TRADES = 2
 MAX_TRADES_PER_DAY = 4
 MAX_DAILY_LOSS_R = -2.0 
 
-# --- DB FUNCTIONS (With Memory Fallback) ---
+# --- SPAM PREVENTION (COOLDOWN) ---
+last_signal_time = {}  # Tracks when we last sent a signal for each pair
+COOLDOWN_HOURS = 4     # Only 1 signal per pair every 4 hours
+
+# --- DB FUNCTIONS ---
 def get_db():
     try:
         return sqlite3.connect("signals.db")
@@ -41,7 +45,8 @@ def init_db():
     try:
         conn = get_db()
         c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS signals (
+        c.execute("DROP TABLE IF EXISTS signals") # Wipe old spam signals on startup
+        c.execute('''CREATE TABLE signals (
                 id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, strategy TEXT, 
                 dir TEXT, score INTEGER, entry REAL, sl REAL, tp REAL,
                 status TEXT DEFAULT 'OPEN')''')
@@ -126,9 +131,7 @@ async def fetch_h1_data(symbol):
         try:
             r = await client.get(url, params=params)
             data = r.json()
-            if "values" not in data: 
-                print(f"API Error {symbol}: {data}")
-                return pd.DataFrame()
+            if "values" not in data: return pd.DataFrame()
             df = pd.DataFrame(data["values"])
             df['datetime'] = pd.to_datetime(df['datetime'])
             df.set_index('datetime', inplace=True)
@@ -139,7 +142,6 @@ async def fetch_h1_data(symbol):
             return df
         except: return pd.DataFrame()
 
-# --- STRATEGY ENGINE (EMA CROSS + S&D) ---
 def check_market(symbol, df_h1):
     try:
         if df_h1.empty or len(df_h1) < 50: return None
@@ -163,7 +165,7 @@ def check_market(symbol, df_h1):
         direction = None
         strategy = None
 
-        # 1. EMA CROSS (High Frequency)
+        # 1. EMA CROSS
         if ema20_c1 < ema50_c1 and ema20_c2 > ema50_c2:
             direction = "long"
             strategy = "EMA 20/50 Bullish Cross"
@@ -171,7 +173,7 @@ def check_market(symbol, df_h1):
             direction = "short"
             strategy = "EMA 20/50 Bearish Cross"
 
-        # 2. S&D ZONE (If no cross)
+        # 2. S&D ZONE
         if not direction:
             for i in range(len(df_h1) - 5, len(df_h1) - 50, -1):
                 c_impulse = df_h1.iloc[i]
@@ -238,11 +240,9 @@ async def check_open_trades(tickers):
         except Exception: pass 
 
 async def worker():
+    global last_signal_time
     tickers = {"EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "XAUUSD": "XAU/USD", "AUDUSD": "AUD/USD", "USDJPY": "USD/JPY"}
     
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram("🤖 <b>Bot Online!</b>\nHunting for EMA Crosses and S&D Zones.")
-
     while True:
         try:
             await check_open_trades(tickers)
@@ -255,7 +255,16 @@ async def worker():
 
             print(f"\n--- Scanning (Trades: {trades_today}/4 | Open: {len(open_trades)}) ---")
             
+            now_utc = datetime.now(timezone.utc)
+            
             for symbol, api_ticker in tickers.items():
+                # CHECK COOLDOWN TO PREVENT SPAM
+                if symbol in last_signal_time:
+                    time_since_last = (now_utc - last_signal_time[symbol]).total_seconds() / 3600.0
+                    if time_since_last < COOLDOWN_HOURS:
+                        print(f"[{symbol}] Skipped: Cooldown active ({time_since_last:.1f}h / {COOLDOWN_HOURS}h).")
+                        continue
+                
                 df_h1 = await fetch_h1_data(api_ticker)
                 sig = check_market(symbol, df_h1)
                 
@@ -263,6 +272,8 @@ async def worker():
                     print(f"!!! SIGNAL FOUND: {symbol} {sig['dir']} !!!")
                     save_signal(sig)
                     await publish("signal", sig)
+                    last_signal_time[symbol] = now_utc # START COOLDOWN
+                    
                     emoji = "🟢" if sig['dir'] == 'long' else "🔴"
                     msg = (f"{emoji} <b>NEW SIGNAL: {sig['symbol']}</b>\n"
                            f"Strategy: {sig['strategy']}\n"
@@ -274,8 +285,6 @@ async def worker():
                     
                     if get_daily_stats()[0] >= MAX_TRADES_PER_DAY or len(get_open_trades()) >= MAX_OPEN_TRADES: 
                         break
-                else:
-                    print(f"[{symbol}] No setup found.")
             
             await asyncio.sleep(60)
         except Exception:
